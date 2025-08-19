@@ -1,3 +1,1 @@
-// This file is no longer needed.
-// The application entry point has been moved to an inline script in `index.html`
-// to allow for in-browser transpilation of TSX/JSX via Babel Standalone.
+// This file is no longer used. All application code has been consolidated into a single inline script in `index.html` to resolve module loading issues in a build-less environment.

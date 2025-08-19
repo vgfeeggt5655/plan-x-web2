@@ -36,10 +36,9 @@
 {
   "imports": {
     "react": "https://esm.sh/react@^19.1.1",
-    "react-dom/": "https://esm.sh/react-dom@^19.1.1/",
-    "react/": "https://esm.sh/react@^19.1.1/",
-    "@google/genai": "https://esm.sh/@google/genai@^1.14.0",
+    "react-dom/client": "https://esm.sh/react-dom@^19.1.1/client",
     "react-router-dom": "https://esm.sh/react-router-dom@^7.8.1",
+    "@google/genai": "https://esm.sh/@google/genai@^1.14.0",
     "pdfjs-dist": "https://esm.sh/pdfjs-dist@4.5.136",
     "jspdf": "https://esm.sh/jspdf@^2.5.1"
   }
@@ -92,16 +91,2482 @@
 </head>
   <body class="bg-background text-text-primary">
     <div id="root"></div>
-    <script type="text/babel" data-presets="react,typescript">
-      import React from 'react';
+    <script type="text/babel" data-presets="react,typescript" data-type="module">
+      import React, { useState, useEffect, useCallback, useMemo, useRef, createContext, useContext, ReactNode } from 'react';
       import ReactDOM from 'react-dom/client';
-      import App from './App.tsx';
+      import { HashRouter, Routes, Route, Outlet, NavLink, useNavigate, Link, useParams } from 'react-router-dom';
+      import { GoogleGenAI, Type } from "@google/genai";
+      import * as pdfjsLib from 'pdfjs-dist';
+      import { jsPDF } from 'jspdf';
+      
+      // ====================================================================================
+      // CONSOLIDATED APPLICATION CODE
+      // All .ts and .tsx files have been inlined here to prevent 404 errors
+      // in a build-less environment.
+      // ====================================================================================
 
+      // --- from types.ts ---
+      interface Resource {
+        id: string;
+        title: string;
+        Subject_Name: string;
+        video_link: string;
+        pdf_link: string;
+        image_url: string;
+      }
+
+      interface User {
+        id: string;
+        name: string;
+        email: string;
+        password: string;
+        role: 'user' | 'admin' | 'super_admin';
+        avatar?: string;
+        watched?: string; // JSON string like '{"resourceId": seconds}'
+      }
+
+      interface Subject {
+        id: string;
+        Subject_Name: string;
+        number: number;
+      }
+
+      interface MCQ {
+        question: string;
+        options: string[];
+        correctAnswer: string;
+      }
+
+      interface Flashcard {
+        front: string;
+        back: string;
+      }
+      
+      // --- from services/archiveService.ts ---
+      const ARCHIVE_ACCESS_KEY = '0tbhVHzeM8sbXkw5';
+      const ARCHIVE_SECRET_KEY = 'LWN6qMF3XXLw5ljq';
+      
+      const getMediaType = (file) => {
+          if (file.type.startsWith('video/')) return 'movies';
+          if (file.type === 'application/pdf') return 'texts';
+          if (file.type.startsWith('image/')) return 'image';
+          return 'texts'; // Default
+      };
+      
+      const uploadFile = (file, itemName, onProgress) => {
+          return new Promise((resolve, reject) => {
+              const url = `https://s3.us.archive.org/${itemName}/${encodeURIComponent(file.name)}`;
+              const mediaType = getMediaType(file);
+
+              const xhr = new XMLHttpRequest();
+              xhr.open('PUT', url, true);
+
+              xhr.setRequestHeader('Authorization', `LOW ${ARCHIVE_ACCESS_KEY}:${ARCHIVE_SECRET_KEY}`);
+              xhr.setRequestHeader('x-amz-auto-make-bucket', '1');
+              xhr.setRequestHeader('x-archive-meta-collection', 'opensource');
+              xhr.setRequestHeader('x-archive-meta-mediatype', mediaType);
+              xhr.setRequestHeader('Content-Type', file.type);
+
+              xhr.upload.onprogress = (event) => {
+                  if (event.lengthComputable) {
+                      const percentComplete = Math.round((event.loaded / event.total) * 100);
+                      onProgress(percentComplete);
+                  }
+              };
+
+              xhr.onload = () => {
+                  if (xhr.status >= 200 && xhr.status < 300) {
+                      const publicUrl = `https://archive.org/download/${itemName}/${encodeURIComponent(file.name)}`;
+                      resolve(publicUrl);
+                  } else {
+                      reject(new Error(`Upload failed: ${xhr.status} ${xhr.statusText} - ${xhr.responseText}`));
+                  }
+              };
+
+              xhr.onerror = () => {
+                  reject(new Error('Network error during upload.'));
+              };
+
+              xhr.send(file);
+          });
+      };
+      
+      // --- from services/geminiService.ts ---
+      const ai = new GoogleGenAI({ apiKey: process?.env?.API_KEY || "" });
+
+      const resizeImage = (base64Str, maxWidth, maxHeight) => {
+          return new Promise((resolve) => {
+              const img = new Image();
+              img.src = base64Str;
+              img.onload = () => {
+                  const canvas = document.createElement('canvas');
+                  let { width, height } = img;
+
+                  if (width > height) {
+                      if (width > maxWidth) {
+                          height *= maxWidth / width;
+                          width = maxWidth;
+                      }
+                  } else {
+                      if (height > maxHeight) {
+                          width *= maxHeight / height;
+                          height = maxHeight;
+                      }
+                  }
+                  canvas.width = width;
+                  canvas.height = height;
+                  const ctx = canvas.getContext('2d');
+                  if (!ctx) {
+                      resolve(base64Str);
+                      return;
+                  }
+                  ctx.drawImage(img, 0, 0, width, height);
+                  resolve(canvas.toDataURL('image/jpeg', 0.8));
+              };
+              img.onerror = () => {
+                  resolve(base64Str);
+              };
+          });
+      };
+
+      const generateImage = async (prompt) => {
+        try {
+          const response = await ai.models.generateImages({
+              model: 'imagen-3.0-generate-002',
+              prompt: `A high-quality, visually appealing educational illustration for the following topic: "${prompt}". The style should be modern, clean, and engaging for learners, suitable for a course thumbnail.`,
+              config: {
+                numberOfImages: 1,
+                outputMimeType: 'image/jpeg',
+                aspectRatio: '16:9',
+              },
+          });
+
+          if (response.generatedImages && response.generatedImages.length > 0) {
+            const base64ImageBytes = response.generatedImages[0].image.imageBytes;
+            const originalDataUrl = `data:image/jpeg;base64,${base64ImageBytes}`;
+            const resizedDataUrl = await resizeImage(originalDataUrl, 800, 450);
+            return resizedDataUrl;
+          } else {
+            throw new Error("No image was generated by the API.");
+          }
+        } catch (error) {
+          console.error("Error generating image with Gemini API:", error);
+          return `https://picsum.photos/seed/${encodeURIComponent(prompt)}/1280/720`;
+        }
+      };
+
+      const generateMCQs = async (pdfText) => {
+        try {
+          const truncatedText = pdfText.length > 20000 ? pdfText.substring(0, 20000) : pdfText;
+          const prompt = `Based on the following text from a medical lecture PDF: "${truncatedText}". Make a quiz of 20 MCQ questions. Each question must have 4 options and one correct answer. Focus on the key points, especially anything that looks like it's from an "objectives" or "summary" slide.`;
+          
+          const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    question: { type: Type.STRING },
+                    options: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    correctAnswer: { type: Type.STRING }
+                  },
+                  required: ["question", "options", "correctAnswer"]
+                }
+              }
+            }
+          });
+
+          const jsonText = response.text.trim();
+          const mcqs = JSON.parse(jsonText);
+          if (!Array.isArray(mcqs)) throw new Error("API did not return a valid array of MCQs.");
+          return mcqs.filter(mcq => mcq.question && Array.isArray(mcq.options) && mcq.options.length > 0 && mcq.correctAnswer && mcq.options.includes(mcq.correctAnswer));
+        } catch (error) {
+          console.error("Error generating MCQs with Gemini API:", error);
+          throw new Error("Failed to generate the quiz. The AI might be busy, please try again later.");
+        }
+      };
+      
+      const generateFlashcards = async (pdfText) => {
+        try {
+          const truncatedText = pdfText.length > 20000 ? pdfText.substring(0, 20000) : pdfText;
+          const prompt = `Based on the following text from a medical lecture PDF, create a set of flashcards. Each flashcard should have a "front" (a question or a term) and a "back" (the answer or definition). Focus on key concepts, definitions, and important facts. Create around 15-20 flashcards. Text: "${truncatedText}"`;
+          
+          const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    front: { type: Type.STRING, description: "The question or term on the front of the card." },
+                    back: { type: Type.STRING, description: "The answer or definition on the back of the card." }
+                  },
+                  required: ["front", "back"]
+                }
+              }
+            }
+          });
+
+          const jsonText = response.text.trim();
+          const flashcards = JSON.parse(jsonText);
+          if (!Array.isArray(flashcards)) throw new Error("API did not return a valid array of flashcards.");
+          return flashcards.filter(fc => fc.front && fc.back);
+        } catch (error) {
+          console.error("Error generating flashcards with Gemini API:", error);
+          throw new Error("Failed to generate flashcards. The AI might be busy, please try again later.");
+        }
+      };
+      
+      // --- from services/googleSheetService.ts ---
+      const GOOGLE_SHEET_RESOURCES_URL = 'https://script.google.com/macros/s/AKfycbxN_P9tB-rr6kVKy9MZwnZ2qb-c8meyTZaloyAglJ48xuJdbopda7PQsROJyipYGzfskw/exec';
+
+      const getResources = async () => {
+        const response = await fetch(GOOGLE_SHEET_RESOURCES_URL);
+        if (!response.ok) throw new Error('Failed to fetch resources');
+        const data = await response.json();
+        const resources = data.data || [];
+        return resources.map((resource) => ({ ...resource, id: String(resource.id) }));
+      };
+
+      const createResource = async (resource) => {
+        const formData = new FormData();
+        formData.append('action', 'create');
+        formData.append('title', resource.title);
+        formData.append('Subject_Name', resource.Subject_Name);
+        formData.append('video_link', resource.video_link);
+        formData.append('pdf_link', resource.pdf_link);
+        formData.append('image_url', resource.image_url);
+        await fetch(GOOGLE_SHEET_RESOURCES_URL, { method: 'POST', mode: 'no-cors', body: formData });
+      };
+
+      const updateResource = async (resource) => {
+          const formData = new FormData();
+          formData.append('action', 'update');
+          formData.append('id', resource.id);
+          formData.append('title', resource.title);
+          formData.append('Subject_Name', resource.Subject_Name);
+          formData.append('video_link', resource.video_link);
+          formData.append('pdf_link', resource.pdf_link);
+          formData.append('image_url', resource.image_url);
+          await fetch(GOOGLE_SHEET_RESOURCES_URL, { method: 'POST', mode: 'no-cors', body: formData });
+      };
+
+      const deleteResource = async (id) => {
+          const formData = new FormData();
+          formData.append('action', 'delete');
+          formData.append('id', id);
+          await fetch(GOOGLE_SHEET_RESOURCES_URL, { method: 'POST', mode: 'no-cors', body: formData });
+      };
+      
+      // --- from services/subjectService.ts ---
+      const GOOGLE_SHEET_SUBJECTS_URL = 'https://script.google.com/macros/s/AKfycby23phjhXwfM8N_5YTgQsKGehhPp7Tw3pa-KFHt1O0IWlKqmIUZv2lekltLhOe-OjeVMg/exec';
+
+      const getSubjects = async () => {
+        const response = await fetch(`${GOOGLE_SHEET_SUBJECTS_URL}?action=get`);
+        if (!response.ok) throw new Error('Failed to fetch subjects');
+        const data = await response.json();
+        const subjects = data.data || [];
+        return subjects.map((s, index) => ({
+          ...s,
+          id: String(s.id),
+          number: s.number !== undefined && s.number !== null ? Number(s.number) : index
+        }));
+      };
+      
+      const addSubject = async (subjectName) => {
+        const formData = new FormData();
+        formData.append('action', 'create');
+        formData.append('Subject_Name', subjectName);
+        await fetch(GOOGLE_SHEET_SUBJECTS_URL, { method: 'POST', mode: 'no-cors', body: formData });
+      };
+
+      const updateSubject = async (id, subjectName, number) => {
+          const formData = new FormData();
+          formData.append('action', 'update');
+          formData.append('id', id);
+          formData.append('Subject_Name', subjectName);
+          if (number !== undefined) {
+              formData.append('number', String(number));
+          }
+          await fetch(GOOGLE_SHEET_SUBJECTS_URL, { method: 'POST', mode: 'no-cors', body: formData });
+      };
+
+      const deleteSubject = async (id) => {
+          const formData = new FormData();
+          formData.append('action', 'delete');
+          formData.append('id', id);
+          await fetch(GOOGLE_SHEET_SUBJECTS_URL, { method: 'POST', mode: 'no-cors', body: formData });
+      };
+      
+      // --- from services/authService.ts ---
+      const GOOGLE_SHEET_USERS_URL = 'https://script.google.com/macros/s/AKfycbwMCPhSKNab-CvtYfY114MdFqcuDS-SkmM3tlgfAr-Osjfxo0VJ04B76cRzgTiW9bmVUg/exec';
+
+      const getUsers = async () => {
+        const response = await fetch(`${GOOGLE_SHEET_USERS_URL}?action=get`);
+        if (!response.ok) throw new Error('Failed to fetch users');
+        const data = await response.json();
+        const users = data.data || [];
+        return users.map((user) => ({ ...user, id: String(user.id) }));
+      };
+      
+      const loginUser = async (email, password) => {
+          const users = await getUsers();
+          const user = users.find(u => u.email.toLowerCase() === email.toLowerCase());
+          if (!user) throw new Error("User not found.");
+          if (String(user.password).trim() !== String(password).trim()) throw new Error("Incorrect password.");
+          return user;
+      };
+
+      const createUser = async (user) => {
+        const formData = new FormData();
+        formData.append('action', 'create');
+        formData.append('name', user.name);
+        formData.append('email', user.email);
+        formData.append('password', user.password);
+        formData.append('role', user.role);
+        formData.append('watched', user.watched || '{}');
+        if (user.avatar) formData.append('avatar', user.avatar);
+        await fetch(GOOGLE_SHEET_USERS_URL, { method: 'POST', mode: 'no-cors', body: formData });
+      };
+
+      const updateUser = async (user) => {
+          const formData = new FormData();
+          formData.append('action', 'update');
+          formData.append('id', user.id);
+          formData.append('name', user.name);
+          formData.append('email', user.email);
+          formData.append('password', user.password);
+          formData.append('role', user.role);
+          if (user.avatar) formData.append('avatar', user.avatar);
+          if (user.watched) formData.append('watched', user.watched);
+          await fetch(GOOGLE_SHEET_USERS_URL, { method: 'POST', mode: 'no-cors', body: formData });
+      };
+
+      const deleteUser = async (id) => {
+          const formData = new FormData();
+          formData.append('action', 'delete');
+          formData.append('id', id);
+          await fetch(GOOGLE_SHEET_USERS_URL, { method: 'POST', mode: 'no-cors', body: formData });
+      };
+      
+      // --- from components/Icons.tsx ---
+      const PlanXIcon = (props) => (
+        <svg {...props} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M16.131,12l5.094-5.094a1,1,0,0,0-1.414-1.414L14.717,10.586,9.623,5.491a1,1,0,0,0-1.414,1.414L13.3,12,8.209,17.094a1,1,0,0,0,1.414,1.414L14.717,13.414l5.094,5.094a1,1,0,0,0,1.414-1.414Z" />
+          <path d="M9.283,10.586,4.189,5.491A1,1,0,0,0,2.775,6.9L7.869,12,2.775,17.094a1,1,0,0,0,1.414,1.414L9.283,13.414,14.377,18.5a1,1,0,0,0,1.414-1.414Z" />
+        </svg>
+      );
+      const PlusCircleIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v6m3-3H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>);
+      const EditIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>);
+      const TrashIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>);
+      const VideoIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>);
+      const DocumentIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>);
+      const LogoutIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>);
+      const UserGroupIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.653-.124-1.282-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.653.124-1.282.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" /></svg>);
+      const ClipboardListIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>);
+      const FilterIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293.707L3.293 7.293A1 1 0 013 6.586V4z" /></svg>);
+      const ChevronDownIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>);
+      const TachometerIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9.518 4.518A9 9 0 002.25 10.5h1.5a7.5 7.5 0 1114.25 0h1.5a9 9 0 00-7.268-5.982z" /><path strokeLinecap="round" strokeLinejoin="round" d="M12 10.5v-.01a.01.01 0 00-.01.01H12zm0 0a2.25 2.25 0 100 4.5 2.25 2.25 0 000-4.5z" /><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6.75l-2.02 2.02" /></svg>);
+      const SearchIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>);
+      const UserCircleIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5.121 17.804A13.937 13.937 0 0112 16c2.5 0 4.847.655 6.879 1.804M15 10a3 3 0 11-6 0 3 3 0 016 0zm6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>);
+      const MenuIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16m-7 6h7" /></svg>);
+      const XIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>);
+      const ArrowUpIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5 15l7-7 7 7" /></svg>);
+      const ArrowDownIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>);
+      const BrainIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4.871 14.883c-1.143-1.423-1.92-3.13-2.191-4.983.033-2.22 1.05-4.32 2.766-5.834C6.987 2.72 8.924 1.99 11 2c1.83.01 3.63.62 5.145 1.77 1.62 1.204 2.72 2.99 2.99 4.93.28 2.1-.42 4.2-1.68 5.86-1.25 1.67-3.12 2.85-5.28 3.2-1.9.31-3.85.03-5.59-1.02-1.12-.67-2.1-1.6-2.92-2.86M12 14.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5z" /><path strokeLinecap="round" strokeLinejoin="round" d="M12 21.5V17m0-15v3.5" /><path strokeLinecap="round" strokeLinejoin="round" d="M5.5 10.5c0 .33.02.66.06 1 .28 2.1.42 4.2 2.94 5.5" /><path strokeLinecap="round" strokeLinejoin="round" d="M18.5 10.5c0 .33-.02.66-.06 1-.28 2.1-.42 4.2-2.94 5.5" /><path strokeLinecap="round" strokeLinejoin="round" d="M8 17s.62 1.38 2 2c1.38.62 2.62.62 4 0 1.38-.62 2-2 2-2" /></svg>);
+      const CheckCircleIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>);
+      const XCircleIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>);
+      const CloudDownloadIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>);
+      const CollectionIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>);
+      const RefreshIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h5M20 20v-5h-5M4 4l1.5 1.5A9 9 0 0120.5 10.5M20 20l-1.5-1.5A9 9 0 003.5 13.5" /></svg>);
+      const ArrowLeftIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg>);
+      const ArrowRightIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>);
+      const PlayIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>);
+      const PauseIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" /></svg>);
+      const SpeedIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>);
+      const CheckIcon = (props) => (<svg {...props} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>);
+
+      // --- from components/Spinner.tsx ---
+      const Spinner = ({ text = 'Loading...' }) => {
+        const isCompact = text === '';
+        return (
+          <div className={`flex items-center justify-center ${isCompact ? 'gap-2 h-5' : 'flex-col gap-4 my-8'}`}>
+            <div className={`flex items-center justify-center ${isCompact ? 'space-x-1.5' : 'space-x-2'}`}>
+              <div className={`${isCompact ? 'w-2 h-2' : 'w-3 h-3'} bg-primary rounded-full animate-bounce`} style={{ animationDelay: '-0.3s' }}></div>
+              <div className={`${isCompact ? 'w-2 h-2' : 'w-3 h-3'} bg-primary rounded-full animate-bounce`} style={{ animationDelay: '-0.15s' }}></div>
+              <div className={`${isCompact ? 'w-2 h-2' : 'w-3 h-3'} bg-primary rounded-full animate-bounce`}></div>
+            </div>
+            {!isCompact && <p className="text-lg text-text-primary font-medium">{text}</p>}
+          </div>
+        );
+      };
+      
+      // --- from components/ProgressBar.tsx ---
+      const ProgressBar = ({ progress, text }) => {
+        return (
+          <div className="w-full my-8">
+            <p className="text-lg text-text-primary font-medium text-center mb-2">{text}</p>
+            <div className="w-full bg-slate-700 rounded-full h-4 overflow-hidden shadow-inner border border-border-color">
+              <div
+                className="bg-gradient-to-r from-primary to-cyan-400 h-4 rounded-full transition-all duration-300 ease-out"
+                style={{ width: `${progress}%` }}
+                role="progressbar"
+                aria-valuenow={progress}
+                aria-valuemin={0}
+                aria-valuemax={100}
+              ></div>
+            </div>
+          </div>
+        );
+      };
+      
+      // --- from contexts/AuthContext.tsx ---
+      const AuthContext = createContext(undefined);
+      const AuthProvider = ({ children }) => {
+        const [user, setUser] = useState(null);
+        const [loading, setLoading] = useState(true);
+        const [error, setError] = useState(null);
+
+        useEffect(() => {
+          try {
+            const storedUser = localStorage.getItem('user');
+            if (storedUser) {
+              setUser(JSON.parse(storedUser));
+            }
+          } catch (e) {
+            console.error("Failed to parse user from local storage", e);
+            localStorage.removeItem('user');
+          } finally {
+            setLoading(false);
+          }
+        }, []);
+
+        const login = async (email, pass) => {
+          setLoading(true);
+          setError(null);
+          try {
+            const loggedInUser = await loginUser(email, pass);
+            setUser(loggedInUser);
+            localStorage.setItem('user', JSON.stringify(loggedInUser));
+            return loggedInUser;
+          } catch (err) {
+            setError(err.message);
+            throw err;
+          } finally {
+            setLoading(false);
+          }
+        };
+        
+        const signup = async (name, email, pass, avatar) => {
+          setLoading(true);
+          setError(null);
+          try {
+              await createUser({ name, email, password: pass, role: 'user', avatar });
+          } catch (err) {
+              setError(err.message);
+              throw err;
+          } finally {
+              setLoading(false);
+          }
+        };
+
+        const logout = () => {
+          setUser(null);
+          localStorage.removeItem('user');
+        };
+
+        const updateCurrentUser = (updatedUser) => {
+          setUser(updatedUser);
+          localStorage.setItem('user', JSON.stringify(updatedUser));
+        };
+
+        const value = { user, loading, error, login, signup, logout, updateCurrentUser };
+        return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+      };
+      
+      const useAuth = () => {
+        const context = useContext(AuthContext);
+        if (context === undefined) {
+          throw new Error('useAuth must be used within an AuthProvider');
+        }
+        return context;
+      };
+      
+      // --- from components/ConfirmDialog.tsx ---
+      const ConfirmDialog = ({
+        isOpen,
+        onClose,
+        onConfirm,
+        title,
+        message,
+        confirmButtonText = 'Confirm',
+        confirmButtonClass = 'bg-red-600 hover:bg-red-700',
+      }) => {
+        if (!isOpen) return null;
+        return (
+          <div 
+            className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex justify-center items-center p-4 transition-opacity duration-300" 
+            aria-modal="true" 
+            role="dialog"
+            onClick={onClose}
+          >
+            <div 
+              className="bg-surface border border-border-color rounded-lg shadow-2xl p-6 w-full max-w-md transform transition-all duration-300 scale-95 opacity-0 animate-fade-in-scale"
+              onClick={(e) => e.stopPropagation()}
+              style={{ animation: 'fade-in-scale 0.3s forwards' }}
+            >
+              <h2 className="text-xl font-bold text-text-primary mb-4">{title}</h2>
+              <div className="text-text-secondary mb-6">{message}</div>
+              <div className="flex justify-end gap-4">
+                <button
+                  onClick={onClose}
+                  className="px-4 py-2 bg-slate-600 text-text-primary rounded-md hover:bg-slate-500 transition-colors font-medium focus:outline-none focus:ring-2 focus:ring-slate-400"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={onConfirm}
+                  className={`px-4 py-2 text-white rounded-md transition-colors font-medium focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-surface ${confirmButtonClass}`}
+                >
+                  {confirmButtonText}
+                </button>
+              </div>
+            </div>
+            <style>{`
+              @keyframes fade-in-scale {
+                from { transform: scale(0.95); opacity: 0; }
+                to { transform: scale(1); opacity: 1; }
+              }
+              .animate-fade-in-scale {
+                animation: fade-in-scale 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+              }
+            `}</style>
+          </div>
+        );
+      };
+
+      // --- from components/ProtectedRoute.tsx ---
+      const ProtectedRoute = ({ children, allowedRoles }) => {
+        const { user, loading } = useAuth();
+        if (loading) {
+          return (
+            <div className="flex justify-center items-center h-screen">
+              <Spinner text="Authenticating..." />
+            </div>
+          );
+        }
+        if (!user) {
+          return <Navigate to="/login" replace />;
+        }
+        if (allowedRoles && allowedRoles.length > 0 && !allowedRoles.includes(user.role)) {
+          return <Navigate to="/" replace />;
+        }
+        return children;
+      };
+
+      // --- from components/Header.tsx ---
+      const Header = () => {
+        const { user, logout } = useAuth();
+        const navigate = useNavigate();
+        const [isDropdownOpen, setDropdownOpen] = useState(false);
+        const [isMenuOpen, setMenuOpen] = useState(false);
+        const dropdownRef = useRef(null);
+        const headerRef = useRef(null);
+
+        const handleLogout = () => {
+          logout();
+          navigate('/login');
+        };
+        
+        useEffect(() => {
+          const handleClickOutside = (event) => {
+            if (headerRef.current && !headerRef.current.contains(event.target)) {
+              setDropdownOpen(false);
+              setMenuOpen(false);
+            }
+          };
+          document.addEventListener('mousedown', handleClickOutside);
+          return () => document.removeEventListener('mousedown', handleClickOutside);
+        }, []);
+
+        const activeLinkClass = "text-primary font-semibold bg-primary/10";
+        const inactiveLinkClass = "text-text-secondary hover:text-primary hover:bg-surface";
+        const linkBaseClass = "flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors";
+
+        const navLinks = (
+          <>
+            <NavLink
+              to="/"
+              end
+              onClick={() => setMenuOpen(false)}
+              className={({ isActive }) => `${linkBaseClass} ${isActive ? activeLinkClass : inactiveLinkClass}`}
+            >
+              All Content
+            </NavLink>
+            {(user?.role === 'admin' || user?.role === 'super_admin') && (
+              <NavLink
+                to="/admin"
+                onClick={() => setMenuOpen(false)}
+                className={({ isActive }) => `${linkBaseClass} ${isActive ? activeLinkClass : inactiveLinkClass}`}
+              >
+                <TachometerIcon className="h-5 w-5" />
+                Dashboard
+              </NavLink>
+            )}
+          </>
+        );
+
+        return (
+          <header ref={headerRef} className="fixed top-0 left-0 right-0 z-50 bg-surface/80 backdrop-blur-md border-b border-border-color">
+            <nav className="container mx-auto px-4 py-3 flex justify-between items-center">
+              <NavLink to="/" className="text-xl font-bold text-text-primary flex items-center gap-2">
+                 <span>Plan X</span>
+              </NavLink>
+              
+              <div className="hidden md:flex items-center gap-2">
+                  {navLinks}
+              </div>
+
+              <div className="flex items-center gap-2">
+                  {user && (
+                     <div className="relative" ref={dropdownRef}>
+                          <button 
+                              onClick={() => setDropdownOpen(!isDropdownOpen)}
+                              className="flex items-center gap-2 text-text-secondary hover:text-text-primary transition-colors p-1 rounded-full hover:bg-primary/20"
+                          >
+                              {user.avatar ? (
+                                  <img src={user.avatar} alt="User Avatar" className="h-8 w-8 rounded-full object-cover border-2 border-primary/50" />
+                              ) : (
+                                  <UserCircleIcon className="h-8 w-8"/>
+                              )}
+                              <span className="hidden sm:inline font-medium">{user.name}</span>
+                              <ChevronDownIcon className={`h-4 w-4 transition-transform ${isDropdownOpen ? 'rotate-180' : ''}`} />
+                          </button>
+                          {isDropdownOpen && (
+                              <div className="absolute right-0 mt-2 w-48 bg-surface border border-border-color rounded-md shadow-lg py-1 z-10 animate-fade-in-up" style={{animationDuration: '0.2s'}}>
+                                  <Link to="/profile" onClick={() => setDropdownOpen(false)} className="flex items-center gap-3 px-4 py-2 text-sm text-text-primary hover:bg-primary/20 hover:text-primary transition-colors">
+                                      <UserCircleIcon className="h-5 w-5" />
+                                      <span>Profile</span>
+                                  </Link>
+                                  <button onClick={handleLogout} className="w-full flex items-center gap-3 px-4 py-2 text-sm text-text-primary hover:bg-red-500/20 hover:text-red-500 transition-colors">
+                                     <LogoutIcon className="h-5 w-5" />
+                                     <span>Logout</span>
+                                  </button>
+                              </div>
+                          )}
+                     </div>
+                  )}
+                  <div className="md:hidden">
+                      <button onClick={() => setMenuOpen(!isMenuOpen)} className="p-2 rounded-md text-text-secondary hover:text-primary hover:bg-primary/20">
+                          {isMenuOpen ? <XIcon className="h-6 w-6" /> : <MenuIcon className="h-6 w-6" />}
+                      </button>
+                  </div>
+              </div>
+            </nav>
+            {isMenuOpen && (
+               <div className="md:hidden bg-surface border-t border-border-color animate-fade-in-up" style={{animationDuration: '0.2s'}}>
+                  <div className="container mx-auto px-4 py-2 flex flex-col gap-1">
+                      {navLinks}
+                  </div>
+               </div>
+            )}
+          </header>
+        );
+      };
+      
+      // --- from components/ResourceCard.tsx ---
+      const ResourceCard = ({ resource, onDelete, userRole, animationDelay, watchProgress }) => {
+        const navigate = useNavigate();
+        const canEdit = userRole === 'admin' || userRole === 'super_admin';
+        const canDelete = userRole === 'super_admin';
+
+        const handleEdit = () => {
+          navigate('/admin', { state: { resourceToEdit: resource } });
+        };
+        
+        const handleWatch = () => {
+          navigate(`/watch/${resource.id}`);
+        };
+
+        return (
+          <div 
+            className="bg-surface rounded-lg shadow-md overflow-hidden transition-all duration-300 hover:shadow-xl hover:shadow-primary/20 hover:-translate-y-1 animate-fade-in-up flex flex-col h-full border border-border-color"
+            style={{ animationDelay }}
+          >
+            <div className="relative aspect-video cursor-pointer" onClick={handleWatch}>
+              <img
+                src={resource.image_url}
+                alt={resource.title}
+                className="w-full h-full object-cover"
+                onError={(e) => {
+                  (e.target).src = `https://picsum.photos/seed/${encodeURIComponent(resource.title)}/1280/720`;
+                }}
+              />
+              {watchProgress !== undefined && watchProgress > 0 && (
+                 <div className="absolute bottom-0 left-0 w-full h-2.5 bg-black/50">
+                     <div 
+                         className="h-full bg-primary rounded-r-full" 
+                         style={{ width: `${watchProgress}%` }}
+                     ></div>
+                 </div>
+              )}
+            </div>
+            
+            <div className="p-4 flex-grow flex flex-col">
+              <div>
+                  <p className="text-xs font-bold text-secondary uppercase tracking-wider mb-1">{resource.Subject_Name}</p>
+                  <h3 
+                    className="text-md font-bold text-text-primary leading-tight hover:text-primary transition-colors cursor-pointer"
+                    onClick={handleWatch}
+                   >
+                    {resource.title}
+                  </h3>
+              </div>
+            </div>
+              
+            {(canEdit || canDelete) && (
+              <div className="flex gap-1 p-2 border-t border-border-color bg-background/50">
+                {canEdit && (
+                  <button
+                    onClick={handleEdit}
+                    className="p-2 text-text-secondary rounded-md hover:bg-slate-600 hover:text-primary transition-colors flex-grow justify-center flex items-center"
+                    aria-label="Edit"
+                  >
+                    <EditIcon className="h-4 w-4" />
+                  </button>
+                )}
+                {canDelete && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDelete(resource.id);
+                    }}
+                    className="p-2 text-text-secondary rounded-md hover:bg-slate-600 hover:text-red-500 transition-colors flex-grow justify-center flex items-center"
+                    aria-label="Delete"
+                  >
+                    <TrashIcon className="h-4 w-4" />
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      };
+      
+      // --- from components/SubjectFilterDialog.tsx ---
+      const SubjectFilterDialog = ({ isOpen, onClose, subjects, selectedSubject, onSelectSubject }) => {
+        if (!isOpen) return null;
+        const handleSelect = (subjectName) => {
+          onSelectSubject(subjectName);
+          onClose();
+        };
+
+        return (
+          <div 
+            className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex justify-center items-center p-4 transition-opacity duration-300" 
+            aria-modal="true" 
+            role="dialog"
+            onClick={onClose}
+          >
+            <div 
+              className="bg-surface border border-border-color rounded-lg shadow-2xl p-6 w-full max-w-md transform transition-all duration-300 scale-95 opacity-0 animate-fade-in-scale"
+              onClick={(e) => e.stopPropagation()}
+              style={{ animation: 'fade-in-scale 0.3s forwards' }}
+            >
+              <h2 className="text-xl font-bold text-text-primary mb-6 text-center">Filter by Subject</h2>
+              <div className="flex flex-col gap-3 max-h-80 overflow-y-auto pr-2 overscroll-y-contain">
+                <button
+                  onClick={() => handleSelect('')}
+                  className={`w-full text-left px-4 py-3 rounded-md text-sm font-medium transition-colors ${!selectedSubject ? 'bg-primary text-background shadow' : 'bg-slate-700 text-text-primary hover:bg-slate-600'}`}
+                >
+                  All Subjects
+                </button>
+                {subjects.map((subject) => (
+                  <button
+                    key={subject.id}
+                    onClick={() => handleSelect(subject.Subject_Name)}
+                    className={`w-full text-left px-4 py-3 rounded-md text-sm font-medium transition-colors ${selectedSubject === subject.Subject_Name ? 'bg-primary text-background shadow' : 'bg-slate-700 text-text-primary hover:bg-slate-600'}`}
+                  >
+                    {subject.Subject_Name}
+                  </button>
+                ))}
+              </div>
+              <div className="mt-6 flex justify-end">
+                <button
+                  onClick={onClose}
+                  className="px-4 py-2 bg-slate-600 text-text-primary rounded-md hover:bg-slate-500 transition-colors font-medium focus:outline-none focus:ring-2 focus:ring-slate-400"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            <style>{`
+              @keyframes fade-in-scale { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+              .animate-fade-in-scale { animation: fade-in-scale 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+            `}</style>
+          </div>
+        );
+      };
+      
+      // --- from components/SubjectSelectionDialog.tsx ---
+      const SubjectSelectionDialog = ({ isOpen, onClose, subjects, selectedSubject, onSelectSubject, }) => {
+        if (!isOpen) return null;
+        const handleSelect = (subjectName) => {
+          onSelectSubject(subjectName);
+          onClose();
+        };
+
+        return (
+          <div
+            className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex justify-center items-center p-4 transition-opacity duration-300"
+            aria-modal="true"
+            role="dialog"
+            onClick={onClose}
+          >
+            <div
+              className="bg-surface border border-border-color rounded-lg shadow-2xl p-6 w-full max-w-md transform transition-all duration-300 scale-95 opacity-0 animate-fade-in-scale"
+              onClick={(e) => e.stopPropagation()}
+              style={{ animation: 'fade-in-scale 0.3s forwards' }}
+            >
+              <h2 className="text-xl font-bold text-text-primary mb-6 text-center">Select a Subject</h2>
+
+              <div className="flex flex-col gap-3 max-h-80 overflow-y-auto pr-2 overscroll-y-contain">
+                {subjects.length === 0 ? (
+                   <p className="text-center text-text-secondary py-4">No subjects available. Please add one in the dashboard.</p>
+                ) : (
+                  subjects.map((subject) => (
+                    <button
+                      key={subject.id}
+                      onClick={() => handleSelect(subject.Subject_Name)}
+                      className={`w-full text-left px-4 py-3 rounded-md text-sm font-medium transition-colors ${selectedSubject === subject.Subject_Name ? 'bg-primary text-background shadow' : 'bg-slate-700 text-text-primary hover:bg-slate-600'}`}
+                    >
+                      {subject.Subject_Name}
+                    </button>
+                  ))
+                )}
+              </div>
+              <div className="mt-6 flex justify-end">
+                <button
+                  onClick={onClose}
+                  className="px-4 py-2 bg-slate-600 text-text-primary rounded-md hover:bg-slate-500 transition-colors font-medium focus:outline-none focus:ring-2 focus:ring-slate-400"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+            <style>{`
+              @keyframes fade-in-scale { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+              .animate-fade-in-scale { animation: fade-in-scale 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+            `}</style>
+          </div>
+        );
+      };
+      
+      // --- from components/PdfViewerModal.tsx ---
+      const PdfViewerModal = ({ isOpen, onClose, pdfUrl, title }) => {
+        if (!isOpen) return null;
+        const embedUrl = `https://docs.google.com/gview?url=${encodeURIComponent(pdfUrl)}&embedded=true`;
+        return (
+          <div 
+            className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm z-50 flex justify-center items-center p-4 transition-opacity duration-300" 
+            aria-modal="true" 
+            role="dialog"
+            onClick={onClose}
+          >
+            <div 
+              className="bg-surface border border-border-color rounded-lg shadow-2xl w-full h-full max-w-6xl flex flex-col transform transition-all duration-300 scale-95 opacity-0 animate-fade-in-scale"
+              onClick={(e) => e.stopPropagation()}
+              style={{ animation: 'fade-in-scale 0.3s forwards' }}
+            >
+              <header className="flex justify-between items-center p-4 border-b border-border-color flex-shrink-0">
+                <h2 className="text-lg font-bold text-text-primary truncate" title={title}>{title}</h2>
+                <button
+                  onClick={onClose}
+                  className="p-2 rounded-full text-text-secondary hover:bg-slate-600 hover:text-text-primary transition-colors"
+                  aria-label="Close PDF viewer"
+                >
+                  <XIcon className="h-6 w-6" />
+                </button>
+              </header>
+              <div className="flex-grow p-1 bg-slate-900">
+                 <iframe
+                      src={embedUrl}
+                      className="w-full h-full border-0"
+                      title={`PDF Viewer for ${title}`}
+                      allowFullScreen
+                  ></iframe>
+              </div>
+            </div>
+             <style>{`
+              @keyframes fade-in-scale { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+              .animate-fade-in-scale { animation: fade-in-scale 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+            `}</style>
+          </div>
+        );
+      };
+      
+      // --- from components/MCQTestModal.tsx ---
+      pdfjsLib.GlobalWorkerOptions.workerSrc = `https://esm.sh/pdfjs-dist@4.5.136/build/pdf.worker.mjs`;
+      const extractTextFromPdf = async (pdfUrl) => {
+          const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(pdfUrl)}`;
+          const loadingTask = pdfjsLib.getDocument(proxyUrl);
+          const pdf = await loadingTask.promise;
+          let fullText = '';
+          for (let i = 1; i <= pdf.numPages; i++) {
+              const page = await pdf.getPage(i);
+              const textContent = await page.getTextContent();
+              const pageText = textContent.items.map(item => ('str' in item ? item.str : '')).join(' ');
+              fullText += pageText + '\n';
+          }
+          return fullText;
+      };
+      
+      const MCQTestModal = ({ isOpen, onClose, resource }) => {
+        const [quizState, setQuizState] = useState('loading');
+        const [loadingStage, setLoadingStage] = useState('');
+        const [mcqs, setMcqs] = useState([]);
+        const [error, setError] = useState(null);
+        const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+        const [userAnswers, setUserAnswers] = useState({});
+        const [selectedOption, setSelectedOption] = useState(null);
+        const [finalAnswers, setFinalAnswers] = useState({});
+        const [score, setScore] = useState(0);
+
+        const loadQuiz = useCallback(async () => {
+          setQuizState('loading');
+          setError(null);
+          setUserAnswers({});
+          setFinalAnswers({});
+          setCurrentQuestionIndex(0);
+          setSelectedOption(null);
+          
+          try {
+            setLoadingStage('Parsing PDF...');
+            const pdfText = await extractTextFromPdf(resource.pdf_link);
+
+            if (!pdfText || pdfText.trim().length < 200) {
+              throw new Error("Could not extract enough text from the PDF to generate a quiz. The file might be empty, corrupted, or an image-based PDF.");
+            }
+
+            setLoadingStage('Generating quiz...');
+            const questions = await generateMCQs(pdfText);
+
+            if (questions.length === 0) {
+              throw new Error("The AI couldn't generate questions for this topic. Please try another one.");
+            }
+            setMcqs(questions);
+            setQuizState('active');
+          } catch (err) {
+            console.error("Quiz generation failed:", err);
+            setError(err.message || 'An unknown error occurred.');
+            setQuizState('error');
+          } finally {
+            setLoadingStage('');
+          }
+        }, [resource]);
+
+        useEffect(() => {
+          if (isOpen) {
+            loadQuiz();
+          }
+        }, [isOpen, loadQuiz]);
+
+        const handleNextQuestion = () => {
+          if (selectedOption) {
+            setUserAnswers(prev => ({ ...prev, [currentQuestionIndex]: selectedOption }));
+          }
+
+          if (currentQuestionIndex < mcqs.length - 1) {
+            setCurrentQuestionIndex(prev => prev + 1);
+            setSelectedOption(userAnswers[currentQuestionIndex + 1] || null);
+          } else {
+            const answers = { ...userAnswers, [currentQuestionIndex]: selectedOption };
+            setFinalAnswers(answers);
+            let finalScore = 0;
+            mcqs.forEach((mcq, index) => {
+              if (answers[index] === mcq.correctAnswer) {
+                finalScore++;
+              }
+            });
+            setScore(finalScore);
+            setQuizState('results');
+          }
+        };
+        
+        const getOptionClass = (option) => {
+          return selectedOption === option ? 'bg-primary/30 border-primary text-primary' : 'bg-surface hover:bg-slate-600 border-border-color';
+        };
+
+        if (!isOpen) return null;
+        const currentQuestion = mcqs[currentQuestionIndex];
+
+        return (
+          <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm z-50 flex justify-center items-center p-4" aria-modal="true" role="dialog">
+            <div className="bg-background border border-border-color rounded-lg shadow-2xl w-full max-w-3xl transform transition-all duration-300 animate-fade-in-up flex flex-col overflow-hidden" style={{minHeight: '400px', maxHeight: '90vh'}}>
+              <header className="flex justify-between items-center p-4 border-b border-border-color flex-shrink-0">
+                <h2 className="text-lg font-bold text-text-primary">Quiz: {resource.title}</h2>
+                <button onClick={onClose} className="p-2 rounded-full hover:bg-slate-600"><XIcon className="h-6 w-6" /></button>
+              </header>
+              <main className="flex-grow p-6 overflow-y-auto overscroll-y-contain">
+                {quizState === 'loading' && <Spinner text={loadingStage} />}
+                {quizState === 'error' && <div className="text-center text-red-400 p-8 flex flex-col items-center justify-center h-full"><p className="font-bold mb-2">Quiz Generation Failed</p><p className="text-sm">{error}</p></div>}
+                {quizState === 'results' && (
+                   <div className="flex flex-col h-full">
+                      <div className="text-center mb-6">
+                          <h3 className="text-2xl font-bold text-text-primary">Quiz Complete!</h3>
+                          <p className="text-5xl font-extrabold text-primary my-2">{score} / {mcqs.length}</p>
+                          <p className="text-lg text-text-secondary">You answered {score} questions correctly.</p>
+                      </div>
+                       <h4 className="text-xl font-bold text-text-primary mb-4 border-b border-border-color pb-2">Review Your Answers</h4>
+                      <div className="space-y-6 overflow-y-auto scrollbar-thin pr-2 flex-grow">
+                          {mcqs.map((mcq, index) => {
+                              const userAnswer = finalAnswers[index];
+                              const isCorrect = userAnswer === mcq.correctAnswer;
+                              return (
+                                  <div key={index} className="border-l-4 pl-4 " style={{borderColor: isCorrect ? '#22D3EE' : '#EC4899'}}>
+                                      <div className="flex items-start gap-2">
+                                           {isCorrect ? <CheckCircleIcon className="h-6 w-6 text-primary flex-shrink-0 mt-1" /> : <XCircleIcon className="h-6 w-6 text-secondary flex-shrink-0 mt-1" />}
+                                          <h5 className="text-md font-semibold text-text-primary">{index + 1}. {mcq.question}</h5>
+                                      </div>
+                                      <div className="pl-8 mt-3 space-y-2 text-sm">
+                                          {mcq.options.map((option, i) => {
+                                              const isCorrectAnswer = option === mcq.correctAnswer;
+                                              const isUserAnswer = option === userAnswer;
+                                              let optionClass = 'text-text-secondary';
+                                              if(isCorrectAnswer) optionClass = 'text-primary font-bold';
+                                              else if(isUserAnswer && !isCorrect) optionClass = 'text-secondary line-through';
+                                              return <p key={i} className={optionClass}>{option}</p>;
+                                          })}
+                                      </div>
+                                      {!isCorrect && <p className="text-xs text-text-secondary mt-2 pl-8">Your answer: <span className="text-secondary">{userAnswer || 'No answer'}</span></p>}
+                                  </div>
+                              );
+                          })}
+                      </div>
+                  </div>
+                )}
+                {quizState === 'active' && currentQuestion && (
+                  <div>
+                    <p className="text-sm font-semibold text-text-secondary mb-2">Question {currentQuestionIndex + 1} of {mcqs.length}</p>
+                    <h4 className="text-xl font-semibold text-text-primary mb-6">{currentQuestion.question}</h4>
+                    <div className="space-y-3">
+                      {currentQuestion.options.map((option, i) => (
+                        <button key={i} onClick={() => setSelectedOption(option)} className={`w-full text-left p-4 rounded-lg border-2 transition-all duration-200 ${getOptionClass(option)}`}>
+                          <span className="font-medium">{option}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </main>
+              <footer className="p-4 border-t border-border-color flex-shrink-0 flex justify-between items-center">
+                  {quizState === 'results' ? (
+                       <div className="flex gap-4">
+                           <button onClick={loadQuiz} className="bg-primary text-background font-bold py-2 px-6 rounded-md hover:bg-cyan-400 transition">Try Again</button>
+                           <button onClick={onClose} className="bg-slate-600 text-text-primary font-bold py-2 px-6 rounded-md hover:bg-slate-500 transition">Close</button>
+                       </div>
+                  ) : quizState === 'active' ? (
+                      <button onClick={handleNextQuestion} disabled={!selectedOption} className="bg-primary text-background font-bold py-2 px-8 rounded-md hover:bg-cyan-400 transition disabled:opacity-50 disabled:cursor-not-allowed ml-auto">
+                      {currentQuestionIndex < mcqs.length - 1 ? 'Next' : 'Finish'}
+                      </button>
+                  ) : ( <div></div> )}
+              </footer>
+            </div>
+          </div>
+        );
+      };
+      
+      // --- from components/FlashcardModal.tsx ---
+      const FlashcardModal = ({ isOpen, onClose, resource }) => {
+          const [cardState, setCardState] = useState('loading');
+          const [flashcards, setFlashcards] = useState([]);
+          const [error, setError] = useState(null);
+          const [currentIndex, setCurrentIndex] = useState(0);
+          const [isFlipped, setIsFlipped] = useState(false);
+          const [isDownloading, setIsDownloading] = useState(false);
+
+          const loadFlashcards = useCallback(async () => {
+              setCardState('loading');
+              setError(null);
+              setCurrentIndex(0);
+              setIsFlipped(false);
+              setFlashcards([]);
+              try {
+                  const pdfText = await extractTextFromPdf(resource.pdf_link);
+                  if (!pdfText || pdfText.trim().length < 100) {
+                      throw new Error("Could not extract enough text from the PDF for flashcards.");
+                  }
+                  const generatedCards = await generateFlashcards(pdfText);
+                  if (generatedCards.length === 0) {
+                      throw new Error("The AI couldn't generate flashcards for this topic.");
+                  }
+                  setFlashcards(generatedCards);
+                  setCardState('active');
+              } catch (err) {
+                  setError(err.message || 'An unknown error occurred.');
+                  setCardState('error');
+              }
+          }, [resource]);
+
+          useEffect(() => {
+              if (isOpen) {
+                  loadFlashcards();
+              }
+          }, [isOpen, loadFlashcards]);
+
+          const handleNext = () => {
+              if (currentIndex < flashcards.length - 1) {
+                  setCurrentIndex(prev => prev + 1);
+                  setIsFlipped(false);
+              }
+          };
+          const handlePrev = () => {
+              if (currentIndex > 0) {
+                  setCurrentIndex(prev => prev - 1);
+                  setIsFlipped(false);
+              }
+          };
+          const handleDownload = () => {
+              if (isDownloading || flashcards.length === 0) return;
+              setIsDownloading(true);
+              try {
+                  const doc = new jsPDF({ orientation: 'p', unit: 'mm', format: 'a4' });
+                  const PAGE_MARGIN = 15, CARD_GUTTER = 8, TEXT_PADDING = 5;
+                  const pageWidth = doc.internal.pageSize.width, pageHeight = doc.internal.pageSize.height;
+                  const contentWidth = pageWidth - (PAGE_MARGIN * 2);
+                  const pageGroups = [];
+                  let currentY = PAGE_MARGIN;
+                  let cardsOnPage = [];
+                  
+                  const cardData = flashcards.map(card => {
+                      doc.setFont('helvetica', 'bold');
+                      doc.setFontSize(14);
+                      const frontLines = doc.splitTextToSize(card.front, contentWidth - (TEXT_PADDING * 2));
+                      const frontHeight = doc.getTextDimensions(frontLines).h;
+                      doc.setFont('helvetica', 'normal');
+                      doc.setFontSize(12);
+                      const backLines = doc.splitTextToSize(card.back, contentWidth - (TEXT_PADDING * 2));
+                      const backHeight = doc.getTextDimensions(backLines).h;
+                      const cardHeight = Math.max(frontHeight, backHeight) + (TEXT_PADDING * 2);
+                      return { front: card.front, back: card.back, height: cardHeight };
+                  });
+
+                  for (const card of cardData) {
+                      if (currentY + card.height > pageHeight - PAGE_MARGIN) {
+                          pageGroups.push({ cards: cardsOnPage });
+                          cardsOnPage = [];
+                          currentY = PAGE_MARGIN;
+                      }
+                      cardsOnPage.push({ text: card.front, y: currentY, height: card.height });
+                      currentY += card.height + CARD_GUTTER;
+                  }
+                  if (cardsOnPage.length > 0) pageGroups.push({ cards: cardsOnPage });
+
+                  let cardDataIndex = 0;
+                  pageGroups.forEach((group, pageIndex) => {
+                      if (pageIndex > 0) doc.addPage();
+                      doc.setFontSize(80); doc.setTextColor(225, 225, 225); doc.text('Plan X', pageWidth / 2, pageHeight / 2, { angle: -45, align: 'center' });
+                      doc.setFontSize(10); doc.setTextColor(150, 150, 150); doc.text(`Questions: ${resource.title}`, PAGE_MARGIN, 10);
+                      group.cards.forEach(cardMeta => {
+                          const card = cardData[cardDataIndex++];
+                          doc.setDrawColor(200, 200, 200); doc.roundedRect(PAGE_MARGIN, cardMeta.y, contentWidth, cardMeta.height, 3, 3, 'S');
+                          doc.setFontSize(14); doc.setFont('helvetica', 'bold'); doc.setTextColor(30, 30, 30);
+                          const questionText = doc.splitTextToSize(card.front, contentWidth - (TEXT_PADDING * 2));
+                          doc.text(questionText, PAGE_MARGIN + TEXT_PADDING, cardMeta.y + TEXT_PADDING + 5);
+                      });
+
+                      doc.addPage();
+                      doc.setFontSize(80); doc.setTextColor(225, 225, 225); doc.text('Plan X', pageWidth / 2, pageHeight / 2, { angle: -45, align: 'center' });
+                      doc.setFontSize(10); doc.setTextColor(150, 150, 150); doc.text(`Answers: ${resource.title}`, PAGE_MARGIN, 10);
+                      cardDataIndex -= group.cards.length;
+                      group.cards.forEach(cardMeta => {
+                          const card = cardData[cardDataIndex++];
+                          doc.setDrawColor(200, 200, 200); doc.roundedRect(PAGE_MARGIN, cardMeta.y, contentWidth, cardMeta.height, 3, 3, 'S');
+                          doc.setFontSize(12); doc.setFont('helvetica', 'normal'); doc.setTextColor(60, 60, 60);
+                          const answerText = doc.splitTextToSize(card.back, contentWidth - (TEXT_PADDING * 2));
+                          doc.text(answerText, PAGE_MARGIN + TEXT_PADDING, cardMeta.y + TEXT_PADDING + 5);
+                      });
+                  });
+                  doc.save(`${resource.title}-flashcards.pdf`);
+              } catch (e) {
+                  console.error("Failed to generate PDF:", e);
+                  alert("Sorry, there was an error creating the PDF.");
+              } finally {
+                  setIsDownloading(false);
+              }
+          };
+          
+          if (!isOpen) return null;
+          const currentCard = flashcards[currentIndex];
+
+          return (
+              <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm z-50 flex justify-center items-center p-4">
+                  <div className="bg-background border border-border-color rounded-lg shadow-2xl w-full max-w-2xl transform transition-all duration-300 animate-fade-in-up flex flex-col overflow-hidden" style={{ minHeight: '450px', maxHeight: '90vh' }}>
+                      <header className="flex justify-between items-center p-4 border-b border-border-color flex-shrink-0">
+                          <h2 className="text-lg font-bold text-text-primary">Flashcards: {resource.title}</h2>
+                          <button onClick={onClose} className="p-2 rounded-full hover:bg-slate-600"><XIcon className="h-6 w-6" /></button>
+                      </header>
+                      <main className="flex-grow p-6 flex flex-col justify-center items-center relative">
+                          {cardState === 'loading' && <Spinner text="Generating flashcards..." />}
+                          {cardState === 'error' && <div className="text-center text-red-400 p-8"><p className="font-bold mb-2">Generation Failed</p><p className="text-sm">{error}</p></div>}
+                          {cardState === 'active' && currentCard && (
+                              <div className="w-full h-full flex flex-col justify-between">
+                                  <div className="w-full flex-grow rounded-lg border-2 border-border-color bg-surface p-6 flex items-center justify-center cursor-pointer perspective-1000" onClick={() => setIsFlipped(!isFlipped)}>
+                                      <div className={`relative w-full h-full preserve-3d transition-transform duration-500 ${isFlipped ? 'rotate-y-180' : ''}`}>
+                                          <div className="absolute w-full h-full backface-hidden flex items-center justify-center"><p className="text-xl text-center text-text-primary">{currentCard.front}</p></div>
+                                          <div className="absolute w-full h-full backface-hidden rotate-y-180 flex items-center justify-center"><p className="text-lg text-center text-text-secondary">{currentCard.back}</p></div>
+                                      </div>
+                                  </div>
+                                  <div className="flex justify-between items-center mt-4">
+                                      <button onClick={handlePrev} disabled={currentIndex === 0} className="p-3 rounded-full hover:bg-slate-700 disabled:opacity-30"><ArrowLeftIcon className="h-6 w-6" /></button>
+                                      <div className="flex items-center gap-4">
+                                          <span className="font-semibold">{currentIndex + 1} / {flashcards.length}</span>
+                                          <button onClick={() => setIsFlipped(!isFlipped)} className="p-3 rounded-full hover:bg-slate-700 text-primary"><RefreshIcon className="h-6 w-6" /></button>
+                                      </div>
+                                      <button onClick={handleNext} disabled={currentIndex === flashcards.length - 1} className="p-3 rounded-full hover:bg-slate-700 disabled:opacity-30"><ArrowRightIcon className="h-6 w-6" /></button>
+                                  </div>
+                              </div>
+                          )}
+                      </main>
+                      <footer className="p-4 border-t border-border-color flex-shrink-0 flex justify-between items-center">
+                          <button onClick={handleDownload} disabled={isDownloading || cardState !== 'active'} className="bg-primary text-background font-bold py-2 px-6 rounded-md hover:bg-cyan-400 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">
+                              {isDownloading ? <Spinner text="" /> : <><CloudDownloadIcon className="h-5 w-5" /> Download PDF</>}
+                          </button>
+                          <button onClick={onClose} className="bg-slate-600 text-text-primary font-bold py-2 px-6 rounded-md hover:bg-slate-500 transition">Close</button>
+                      </footer>
+                  </div>
+                   <style>{`
+                      .perspective-1000 { perspective: 1000px; }
+                      .preserve-3d { transform-style: preserve-3d; }
+                      .rotate-y-180 { transform: rotateY(180deg); }
+                      .backface-hidden { backface-visibility: hidden; }
+                  `}</style>
+              </div>
+          );
+      };
+      
+      // --- from pages/LoginPage.tsx ---
+      const LoginPage = () => {
+        const [email, setEmail] = useState('');
+        const [password, setPassword] = useState('');
+        const { login, error } = useAuth();
+        const [loading, setLoading] = useState(false);
+        const navigate = useNavigate();
+
+        const handleSubmit = async (e) => {
+          e.preventDefault();
+          setLoading(true);
+          try {
+            await login(email, password);
+            navigate('/');
+          } catch (err) {
+            console.error(err);
+          } finally {
+            setLoading(false);
+          }
+        };
+        
+        const inputClass = "mt-1 block w-full px-3 py-2 bg-surface border border-border-color rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-primary sm:text-sm text-text-primary placeholder-text-secondary transition";
+
+        return (
+          <div className="min-h-screen bg-background flex flex-col justify-center items-center px-4 py-12">
+            <div className="max-w-md w-full mx-auto">
+              <div className="flex flex-col justify-center items-center mb-6">
+                 <img src="https://png.pngtree.com/png-vector/20250423/ourmid/pngtree-3d-cartoon-doctor-character-young-male-round-glasses-png-image_16046563.png" alt="Plan X Avatar" className="w-24 h-24 rounded-full object-cover mb-4 border-4 border-primary/50" />
+                <h1 className="text-3xl font-bold text-text-primary">Welcome to Plan X</h1>
+              </div>
+              <div className="bg-surface border border-border-color px-4 py-6 sm:p-8 rounded-xl shadow-lg">
+                <h2 className="text-2xl font-bold text-center text-text-primary mb-6">Login</h2>
+                {loading ? <Spinner text="Logging in..." /> : (
+                  <form onSubmit={handleSubmit} className="space-y-6" autoComplete="on">
+                    {error && <div className="bg-red-500/20 border-l-4 border-red-400 text-red-300 p-4 rounded-md" role="alert"><p>{error}</p></div>}
+                    <div>
+                      <label htmlFor="email" className="block text-sm font-medium text-text-secondary">Email Address</label>
+                      <input type="email" name="email" id="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="email" className={inputClass} />
+                    </div>
+                    <div>
+                      <label htmlFor="password" className="block text-sm font-medium text-text-secondary">Password</label>
+                      <input type="password" name="password" id="password" value={password} onChange={(e) => setPassword(e.target.value)} required autoComplete="current-password" className={inputClass} />
+                    </div>
+                    <div>
+                      <button type="submit" className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-background bg-primary hover:bg-cyan-400 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-surface focus:ring-primary transition-all transform hover:scale-105">
+                        Sign in
+                      </button>
+                    </div>
+                  </form>
+                )}
+                 <p className="mt-6 text-center text-sm text-text-secondary">
+                  Don't have an account?{' '}
+                  <Link to="/signup" className="font-medium text-primary hover:text-cyan-400">
+                    Sign up
+                  </Link>
+                </p>
+              </div>
+            </div>
+          </div>
+        );
+      };
+      
+      // --- from pages/SignupPage.tsx ---
+      const AVATARS_SIGNUP = [
+          'https://png.pngtree.com/png-vector/20250423/ourmid/pngtree-3d-cartoon-doctor-character-young-male-round-glasses-png-image_16046563.png',
+          'https://png.pngtree.com/png-vector/20250210/ourmid/pngtree-male-doctor-showing-a-thumbs-up-sign-symbolizing-approval-in-3d-png-image_15433614.png',
+          'https://png.pngtree.com/png-vector/20250409/ourmid/pngtree-3d-male-doctor-character-png-image_15952878.png',
+          'https://t4.ftcdn.net/jpg/06/14/96/05/360_F_614960515_mQsF7nS1r3qZ9eCHzqJ5cyCxmjsfJOCQ.jpg',
+          'https://img.freepik.com/premium-photo/3d-cartoon-character-female-doctor_299560-352.jpg',
+          'https://i.pinimg.com/736x/1f/25/f5/1f25f5903952a2dbca09050725ebae35.jpg',
+      ];
+
+      const SignupPage = () => {
+        const [name, setName] = useState('');
+        const [email, setEmail] = useState('');
+        const [password, setPassword] = useState('');
+        const [confirmPassword, setConfirmPassword] = useState('');
+        const [selectedAvatar, setSelectedAvatar] = useState(AVATARS_SIGNUP[0]);
+        const { signup } = useAuth();
+        const [loading, setLoading] = useState(false);
+        const [error, setError] = useState(null);
+        const navigate = useNavigate();
+
+        const handleSubmit = async (e) => {
+          e.preventDefault();
+          if (!name.trim()) { setError("Full Name is required."); return; }
+          if (password !== confirmPassword) { setError("Passwords do not match."); return; }
+          setError(null);
+          setLoading(true);
+          try {
+            let formattedName = name.trim();
+            if (!/^dr\.?\s/i.test(formattedName)) {
+                formattedName = `Dr. ${formattedName}`;
+            }
+            await signup(formattedName, email, password, selectedAvatar);
+            alert('Signup successful! Please log in.');
+            navigate('/login');
+          } catch (err) {
+            setError(err.message || 'An unexpected error occurred.');
+            console.error(err);
+          } finally {
+            setLoading(false);
+          }
+        };
+
+        const inputClass = "mt-1 block w-full px-3 py-2 bg-surface border border-border-color rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-primary sm:text-sm text-text-primary placeholder-text-secondary transition";
+
+        return (
+          <div className="min-h-screen bg-background flex flex-col justify-center items-center px-4 py-12">
+            <div className="max-w-md w-full mx-auto">
+              <div className="flex justify-center items-center mb-6">
+                <h1 className="text-3xl font-bold text-text-primary ml-3">Create Your Plan X Account</h1>
+              </div>
+              <div className="bg-surface border border-border-color px-4 py-6 sm:p-8 rounded-xl shadow-lg">
+                <h2 className="text-2xl font-bold text-center text-text-primary mb-6">Create Account</h2>
+                {loading ? <Spinner text="Creating account..." /> : (
+                  <form onSubmit={handleSubmit} className="space-y-6">
+                    {error && <div className="bg-red-500/20 border-l-4 border-red-400 text-red-300 p-4 rounded-md" role="alert"><p>{error}</p></div>}
+                    <div>
+                        <label className="block text-sm font-medium text-text-secondary mb-2 text-center">Choose Your Avatar</label>
+                        <div className="flex justify-center items-center flex-wrap gap-3">
+                          {AVATARS_SIGNUP.map((avatar, index) => (
+                            <button type="button" key={index} onClick={() => setSelectedAvatar(avatar)} className={`rounded-full transition-all duration-200 ${selectedAvatar === avatar ? 'ring-4 ring-primary' : 'ring-2 ring-transparent hover:ring-primary/50'}`}>
+                              <img src={avatar} alt={`Avatar ${index + 1}`} className="w-16 h-16 rounded-full object-cover border-2 border-surface" />
+                            </button>
+                          ))}
+                        </div>
+                    </div>
+                    <div>
+                      <label htmlFor="name" className="block text-sm font-medium text-text-secondary">Full Name</label>
+                      <input type="text" name="name" id="name" value={name} onChange={(e) => setName(e.target.value)} required autoComplete="name" className={inputClass} />
+                    </div>
+                    <div>
+                      <label htmlFor="email" className="block text-sm font-medium text-text-secondary">Email Address</label>
+                      <input type="email" name="email" id="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="email" className={inputClass} />
+                    </div>
+                    <div>
+                      <label htmlFor="password" className="block text-sm font-medium text-text-secondary">Password</label>
+                      <input type="password" name="password" id="password" value={password} onChange={(e) => setPassword(e.target.value)} required autoComplete="new-password" className={inputClass} />
+                    </div>
+                    <div>
+                      <label htmlFor="confirmPassword" className="block text-sm font-medium text-text-secondary">Confirm Password</label>
+                      <input type="password" name="confirmPassword" id="confirmPassword" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} required autoComplete="new-password" className={inputClass} />
+                    </div>
+                    <div>
+                      <button type="submit" className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-background bg-primary hover:bg-cyan-400 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-background focus:ring-primary transition-all transform hover:scale-105">
+                        Sign up
+                      </button>
+                    </div>
+                  </form>
+                )}
+                 <p className="mt-6 text-center text-sm text-text-secondary">
+                  Already have an account?{' '}
+                  <Link to="/login" className="font-medium text-primary hover:text-cyan-400">
+                    Log in
+                  </Link>
+                </p>
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      // --- from pages/ProfilePage.tsx ---
+      const AVATARS_PROFILE = [
+          'https://png.pngtree.com/png-vector/20250423/ourmid/pngtree-3d-cartoon-doctor-character-young-male-round-glasses-png-image_16046563.png',
+          'https://png.pngtree.com/png-vector/20250210/ourmid/pngtree-male-doctor-showing-a-thumbs-up-sign-symbolizing-approval-in-3d-png-image_15433614.png',
+          'https://png.pngtree.com/png-vector/20250409/ourmid/pngtree-3d-male-doctor-character-png-image_15952878.png',
+          'https://t4.ftcdn.net/jpg/06/14/96/05/360_F_614960515_mQsF7nS1r3qZ9eCHzqJ5cyCxmjsfJOCQ.jpg',
+          'https://img.freepik.com/premium-photo/3d-cartoon-character-female-doctor_299560-352.jpg',
+          'https://i.pinimg.com/736x/1f/25/f5/1f25f5903952a2dbca09050725ebae35.jpg',
+      ];
+      
+      const ProfilePage = () => {
+          const { user, updateCurrentUser } = useAuth();
+          const [name, setName] = useState(user?.name || '');
+          const [avatar, setAvatar] = useState(user?.avatar || '');
+          const [profileLoading, setProfileLoading] = useState(false);
+          const [profileError, setProfileError] = useState(null);
+          const [profileSuccess, setProfileSuccess] = useState(null);
+          const [newPassword, setNewPassword] = useState('');
+          const [confirmPassword, setConfirmPassword] = useState('');
+          const [passwordLoading, setPasswordLoading] = useState(false);
+          const [passwordError, setPasswordError] = useState(null);
+          const [passwordSuccess, setPasswordSuccess] = useState(null);
+          
+          const getFormattedVersion = (currentName) => {
+              let formatted = currentName.trim();
+              if (!/^dr\.?\s/i.test(formatted)) return `Dr. ${formatted}`;
+              return formatted;
+          };
+
+          const handleProfileSubmit = async (e) => {
+              e.preventDefault();
+              if (!user) return;
+              if (!name.trim()) { setProfileError("Name cannot be empty."); return; }
+              const formattedName = getFormattedVersion(name);
+              if (formattedName === user.name && avatar === user.avatar) return;
+              setProfileLoading(true); setProfileError(null); setProfileSuccess(null);
+              try {
+                  const updatedUser = { ...user, name: formattedName, avatar };
+                  await updateUser(updatedUser);
+                  updateCurrentUser(updatedUser);
+                  setProfileSuccess("Your profile has been updated successfully!");
+              } catch (err) {
+                  console.error("Failed to update profile:", err);
+                  setProfileError("Failed to update your profile. Please try again.");
+              } finally {
+                  setProfileLoading(false);
+              }
+          };
+          
+          const handlePasswordSubmit = async (e) => {
+              e.preventDefault();
+              if (!user) return;
+              if (newPassword !== confirmPassword) { setPasswordError("New passwords do not match."); return; }
+              if (!newPassword) { setPasswordError("New password cannot be empty."); return; }
+              setPasswordLoading(true); setPasswordError(null); setPasswordSuccess(null);
+              try {
+                  const updatedUser = { ...user, password: newPassword };
+                  await updateUser(updatedUser);
+                  updateCurrentUser(updatedUser);
+                  setPasswordSuccess("Password updated successfully!");
+                  setNewPassword('');
+                  setConfirmPassword('');
+              } catch (err) {
+                  console.error("Failed to update password:", err);
+                  setPasswordError("Failed to update your password. Please try again.");
+              } finally {
+                  setPasswordLoading(false);
+              }
+          };
+          
+          const inputClass = "mt-1 block w-full px-3 py-2 bg-surface border border-border-color rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-primary sm:text-sm text-text-primary placeholder-text-secondary transition";
+          const isProfileUnchanged = user && getFormattedVersion(name) === user.name && avatar === user.avatar;
+
+          if (!user) return <div className="pt-24"><Spinner text="Loading profile..." /></div>;
+          
+          return (
+              <div className="container mx-auto px-4 py-8 pt-20 sm:pt-24">
+                  <div className="max-w-4xl mx-auto space-y-8 animate-fade-in-up">
+                      <div className="bg-surface border border-border-color px-4 py-6 sm:p-8 rounded-xl shadow-lg">
+                          <h1 className="text-3xl font-bold text-text-primary mb-1">My Profile</h1>
+                          <p className="text-text-secondary mb-6">View and edit your personal information.</p>
+                          <form onSubmit={handleProfileSubmit} className="space-y-6">
+                              {profileError && <div className="bg-red-500/20 border-l-4 border-red-400 text-red-300 p-4 rounded-md" role="alert"><p>{profileError}</p></div>}
+                              {profileSuccess && <div className="bg-green-500/20 border-l-4 border-green-400 text-green-300 p-4 rounded-md" role="alert"><p>{profileSuccess}</p></div>}
+                              <div>
+                                  <label className="block text-sm font-medium text-text-secondary mb-2">Avatar</label>
+                                  <div className="flex items-center gap-4 flex-wrap">
+                                      <img src={avatar} alt="Current Avatar" className="w-20 h-20 rounded-full object-cover border-4 border-primary/50" />
+                                      <div className="flex flex-wrap gap-2">
+                                          {AVATARS_PROFILE.map((av, index) => (
+                                              <button type="button" key={index} onClick={() => setAvatar(av)} className={`rounded-full transition-all duration-200 ${avatar === av ? 'ring-4 ring-primary' : 'ring-2 ring-transparent hover:ring-primary/50'}`}>
+                                                  <img src={av} alt={`Avatar ${index + 1}`} className="w-12 h-12 rounded-full object-cover border-2 border-surface" />
+                                              </button>
+                                          ))}
+                                      </div>
+                                  </div>
+                              </div>
+                              <div>
+                                  <label htmlFor="name" className="block text-sm font-medium text-text-secondary">Full Name</label>
+                                  <input type="text" id="name" value={name} onChange={(e) => setName(e.target.value)} required className={inputClass} />
+                              </div>
+                              <div>
+                                  <label htmlFor="email" className="block text-sm font-medium text-text-secondary">Email Address</label>
+                                  <input type="email" id="email" value={user.email} disabled className={`${inputClass} bg-slate-700/50 cursor-not-allowed`} />
+                              </div>
+                              <div>
+                                  <button type="submit" className="w-full sm:w-auto inline-flex justify-center py-2 px-6 border border-transparent rounded-md shadow-sm text-sm font-medium text-background bg-primary hover:bg-cyan-400 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-surface focus:ring-primary transition-all transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:scale-100" disabled={profileLoading || isProfileUnchanged}>
+                                      {profileLoading ? <Spinner text="" /> : 'Save Profile Changes'}
+                                  </button>
+                              </div>
+                          </form>
+                      </div>
+                      <div className="bg-surface border border-border-color px-4 py-6 sm:p-8 rounded-xl shadow-lg">
+                          <h2 className="text-2xl font-bold text-text-primary mb-1">Change Password</h2>
+                           <p className="text-text-secondary mb-6">Update your password for enhanced security.</p>
+                           <form onSubmit={handlePasswordSubmit} className="space-y-4">
+                              {passwordError && <div className="bg-red-500/20 border-l-4 border-red-400 text-red-300 p-4 rounded-md" role="alert"><p>{passwordError}</p></div>}
+                              {passwordSuccess && <div className="bg-green-500/20 border-l-4 border-green-400 text-green-300 p-4 rounded-md" role="alert"><p>{passwordSuccess}</p></div>}
+                               <div>
+                                  <label htmlFor="newPassword" className="block text-sm font-medium text-text-secondary">New Password</label>
+                                  <input type="password" id="newPassword" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} required className={inputClass} />
+                              </div>
+                               <div>
+                                  <label htmlFor="confirmPassword" className="block text-sm font-medium text-text-secondary">Confirm New Password</label>
+                                  <input type="password" id="confirmPassword" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} required className={inputClass} />
+                              </div>
+                               <div>
+                                  <button type="submit" className="w-full sm:w-auto inline-flex justify-center py-2 px-6 border border-transparent rounded-md shadow-sm text-sm font-medium text-background bg-primary hover:bg-cyan-400 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-surface focus:ring-primary transition-all transform hover:scale-105 disabled:opacity-50" disabled={passwordLoading}>
+                                      {passwordLoading ? <Spinner text="" /> : 'Change Password'}
+                                  </button>
+                              </div>
+                           </form>
+                      </div>
+                  </div>
+              </div>
+          );
+      };
+
+      // --- from pages/HomePage.tsx ---
+      const encouragingMessages = [
+          "Your next discovery is just a search away. What will you learn today?",
+          "Unlock new knowledge. Find the perfect lecture to spark your curiosity.",
+          "The journey of a thousand miles begins with a single click. Start learning now.",
+          "Expand your horizons. Search for a topic and let the learning begin.",
+          "Knowledge is power. Find your next lecture and empower yourself."
+      ];
+      const parseWatchedData = (watched) => {
+          if (!watched || typeof watched !== 'string' || watched.trim() === '') return {};
+          try {
+              const data = JSON.parse(watched);
+              if (typeof data !== 'object' || data === null || Array.isArray(data)) return {};
+              const normalizedData = {};
+              for (const key in data) {
+                  if (typeof data[key] === 'number') {
+                      normalizedData[key] = { time: data[key], duration: 0 };
+                  } else if (typeof data[key] === 'object' && 'time' in data[key] && 'duration' in data[key]) {
+                      normalizedData[key] = data[key];
+                  }
+              }
+              return normalizedData;
+          } catch (e) {
+              console.error("Failed to parse watched data", e);
+              return {};
+          }
+      };
+      
+      const HomePage = () => {
+        const [resources, setResources] = useState([]);
+        const [subjects, setSubjects] = useState([]);
+        const [loading, setLoading] = useState(true);
+        const [error, setError] = useState(null);
+        const [dialogState, setDialogState] = useState({isOpen: false, resourceId: null});
+        const [searchTerm, setSearchTerm] = useState('');
+        const [selectedSubject, setSelectedSubject] = useState('');
+        const [isFilterOpen, setFilterOpen] = useState(false);
+        const [heroMessage, setHeroMessage] = useState('');
+        const { user } = useAuth();
+        const navigate = useNavigate();
+
+        const fetchInitialData = useCallback(async () => {
+          try {
+            setLoading(true);
+            setError(null);
+            const [resourcesData, subjectsData] = await Promise.all([getResources(), getSubjects()]);
+            setResources(resourcesData.reverse());
+            const sortedSubjects = subjectsData.sort((a, b) => a.number - b.number);
+            setSubjects(sortedSubjects);
+          } catch (err) {
+            setError('Failed to load content. Please try again later.');
+            console.error(err);
+          } finally {
+            setLoading(false);
+          }
+        }, []);
+
+        useEffect(() => {
+          fetchInitialData();
+          const randomIndex = Math.floor(Math.random() * encouragingMessages.length);
+          setHeroMessage(encouragingMessages[randomIndex]);
+        }, [fetchInitialData]);
+        
+        const filteredResources = useMemo(() => {
+          const searchWords = searchTerm.toLowerCase().split(' ').filter(w => w.length > 0);
+          return resources.filter(r => {
+              if (searchWords.length === 0) return true;
+              const title = r.title.toLowerCase();
+              const subject = r.Subject_Name.toLowerCase();
+              return searchWords.every(word => title.includes(word) || subject.includes(word));
+            }).filter(r => selectedSubject ? r.Subject_Name === selectedSubject : true);
+        }, [resources, searchTerm, selectedSubject]);
+        
+        const watchedData = useMemo(() => parseWatchedData(user?.watched), [user]);
+        
+        const continueWatchingResources = useMemo(() => {
+            const watchedEntries = Object.entries(watchedData);
+            if (watchedEntries.length === 0) return [];
+            const resourceMap = new Map(resources.map(r => [r.id, r]));
+            return watchedEntries
+                .map(([id, progress]) => {
+                    const resource = resourceMap.get(id);
+                    if (!resource) return null;
+                    const percentage = progress.duration > 0 ? (progress.time / progress.duration) * 100 : 0;
+                    return { resource, progress: percentage };
+                })
+                .filter((item) => item !== null)
+                .sort((a, b) => (watchedData[b.resource.id]?.time || 0) - (watchedData[a.resource.id]?.time || 0));
+        }, [resources, watchedData]);
+
+        const groupedResources = useMemo(() => {
+          return filteredResources.reduce((acc, resource) => {
+              const subject = resource.Subject_Name || 'Uncategorized';
+              if (!acc[subject]) acc[subject] = [];
+              acc[subject].push(resource);
+              return acc;
+          }, {});
+        }, [filteredResources]);
+        
+        const orderedSubjects = useMemo(() => {
+          const visibleSubjects = new Set(filteredResources.map(r => r.Subject_Name));
+          return subjects.filter(s => visibleSubjects.has(s.Subject_Name));
+        }, [filteredResources, subjects]);
+
+        const handleDeleteRequest = (id) => { setDialogState({ isOpen: true, resourceId: id }); };
+        const handleConfirmDelete = async () => {
+          if (!dialogState.resourceId) return;
+          try {
+            await deleteResource(dialogState.resourceId);
+            setResources(prev => prev.filter(r => r.id !== dialogState.resourceId));
+          } catch (err) {
+            alert('Failed to delete resource. Please try again.');
+            console.error(err);
+          } finally {
+            setDialogState({ isOpen: false, resourceId: null });
+          }
+        };
+        
+        const targetedResource = resources.find(r => r.id === dialogState.resourceId);
+
+        if (loading) return <div className="pt-24"><Spinner /></div>;
+        if (error) return <div className="pt-24 text-center text-red-500 text-xl">{error}</div>;
+
+        return (
+          <div className="space-y-12 pb-12">
+            <div className="bg-gradient-to-br from-background to-slate-800 pt-36 pb-24 text-center border-b border-border-color">
+              <div className="container mx-auto px-4">
+                <h1 className="text-4xl md:text-5xl font-extrabold text-text-primary mb-4 animate-fade-in-up">
+                   Welcome back, <span className="text-primary">{user?.name || 'Explorer'}</span>!
+                </h1>
+                <p className="text-lg text-text-secondary max-w-2xl mx-auto mb-8 animate-fade-in-up" style={{animationDelay: '0.1s'}}>
+                  {heroMessage}
+                </p>
+                <div className="max-w-2xl mx-auto bg-surface p-2 rounded-full shadow-lg flex items-center gap-1 sm:gap-2 animate-fade-in-up border border-border-color" style={{animationDelay: '0.2s'}}>
+                  <SearchIcon className="ml-4 h-5 w-5 sm:h-6 sm:w-6 text-gray-400 flex-shrink-0" />
+                  <input type="text" placeholder="Search courses..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="w-full bg-transparent focus:outline-none text-base sm:text-lg text-text-primary placeholder-text-secondary" />
+                  <button onClick={() => setFilterOpen(true)} className="flex-shrink-0 inline-flex items-center gap-2 px-3 sm:px-5 py-2 sm:py-3 border border-transparent text-sm sm:text-base font-medium rounded-full text-white bg-primary hover:bg-cyan-400 transition-colors shadow-md shadow-primary/20 hover:shadow-lg hover:shadow-primary/40">
+                    <FilterIcon className="h-5 w-5" />
+                    <span className="hidden md:inline">Filter</span>
+                     {selectedSubject && <span className="hidden md:inline bg-white/20 text-white text-xs font-bold px-2 py-1 rounded-full">{selectedSubject}</span>}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="container mx-auto px-4">
+              {continueWatchingResources.length > 0 && (
+                <section className="-mt-12">
+                  <h2 className="text-2xl font-bold text-text-primary mb-4">Continue Watching</h2>
+                  <div className="relative">
+                    <div className="flex overflow-x-auto gap-6 pb-4 scrollbar-thin overscroll-x-contain">
+                      {continueWatchingResources.map(({ resource, progress }, index) => (
+                        <div key={resource.id} className="flex-shrink-0 w-72 sm:w-80">
+                          <ResourceCard resource={resource} onDelete={handleDeleteRequest} userRole={user?.role} animationDelay={`${index * 50}ms`} watchProgress={progress} />
+                        </div>
+                      ))}
+                    </div>
+                    <div className="absolute top-0 right-0 bottom-0 w-16 bg-gradient-to-l from-background pointer-events-none md:hidden"></div>
+                  </div>
+                </section>
+              )}
+
+              <div className={`space-y-10 ${continueWatchingResources.length > 0 ? 'mt-16' : '-mt-8'}`}>
+                {filteredResources.length === 0 && searchTerm.length > 0 ? (
+                  <p className="text-center text-text-secondary text-lg pt-10">
+                    No courses found matching your criteria.
+                  </p>
+                ) : (
+                  orderedSubjects.map((subject) => (
+                    <section key={subject.id}>
+                      <h2 className="text-2xl font-bold text-text-primary mb-4">{subject.Subject_Name}</h2>
+                      <div className="relative">
+                        <div className="flex overflow-x-auto gap-6 pb-4 scrollbar-thin overscroll-x-contain">
+                          {groupedResources[subject.Subject_Name].map((resource, index) => (
+                            <div key={resource.id} className="flex-shrink-0 w-72 sm:w-80">
+                              <ResourceCard resource={resource} onDelete={handleDeleteRequest} userRole={user?.role} animationDelay={`${index * 50}ms`} />
+                            </div>
+                          ))}
+                        </div>
+                        <div className="absolute top-0 right-0 bottom-0 w-16 bg-gradient-to-l from-background pointer-events-none md:hidden"></div>
+                      </div>
+                    </section>
+                  ))
+                )}
+              </div>
+            </div>
+            <ConfirmDialog isOpen={dialogState.isOpen} onClose={() => setDialogState({ isOpen: false, resourceId: null })} onConfirm={handleConfirmDelete} title="Delete Resource" message={<>Are you sure you want to delete this resource?<br /><strong>{targetedResource?.title}</strong><br />This action cannot be undone.</>} confirmButtonText="Delete" confirmButtonClass="bg-red-600 hover:bg-red-700 focus:ring-red-500" />
+            <SubjectFilterDialog isOpen={isFilterOpen} onClose={() => setFilterOpen(false)} subjects={subjects} selectedSubject={selectedSubject} onSelectSubject={setSelectedSubject} />
+          </div>
+        );
+      };
+      
+      // --- from pages/WatchPage.tsx ---
+      const parseWatchedDataWatch = (watched) => {
+          if (!watched || typeof watched !== 'string' || watched.trim() === '') return {};
+          try {
+              const data = JSON.parse(watched);
+              if (typeof data !== 'object' || data === null || Array.isArray(data)) return {};
+              const normalizedData = {};
+              for (const key in data) {
+                  if (typeof data[key] === 'number') {
+                      normalizedData[key] = { time: data[key], duration: 0 };
+                  } else if (typeof data[key] === 'object' && 'time' in data[key] && 'duration' in data[key]) {
+                      normalizedData[key] = data[key];
+                  }
+              }
+              return normalizedData;
+          } catch (e) { console.error("Failed to parse watched data", e); return {}; }
+      };
+      const getYoutubeVideoId = (url) => {
+          let videoId = null;
+          try {
+              const urlObj = new URL(url);
+              if (urlObj.hostname === 'youtu.be') {
+                  videoId = urlObj.pathname.slice(1);
+              } else if (urlObj.hostname.includes('youtube.com')) {
+                  videoId = urlObj.searchParams.get('v');
+              }
+          } catch (e) { console.error("Invalid URL for YouTube parsing", e); }
+          return videoId;
+      };
+      
+      const WatchPage = () => {
+          const { resourceId } = useParams();
+          const { user, updateCurrentUser } = useAuth();
+          const [allResources, setAllResources] = useState([]);
+          const [resource, setResource] = useState(null);
+          const [loading, setLoading] = useState(true);
+          const [error, setError] = useState(null);
+          const [isPdfOpen, setPdfOpen] = useState(false);
+          const [isTestOpen, setTestOpen] = useState(false);
+          const [isFlashcardOpen, setFlashcardOpen] = useState(false);
+          const [isPdfDownloading, setIsPdfDownloading] = useState(false);
+          const [isVideoDownloading, setIsVideoDownloading] = useState(false);
+          const [isPlaying, setIsPlaying] = useState(false);
+          const [playbackRate, setPlaybackRate] = useState(1);
+          const [isSpeedMenuOpen, setIsSpeedMenuOpen] = useState(false);
+          const videoRef = useRef(null);
+          const ytPlayerRef = useRef(null);
+          const speedMenuRef = useRef(null);
+          const currentTimeRef = useRef(0);
+          const durationRef = useRef(0);
+          const watchedDataRef = useRef({});
+
+          const isYoutubeVideo = useMemo(() => {
+              if (!resource) return false;
+              return resource.video_link.includes('youtube.com') || resource.video_link.includes('youtu.be');
+          }, [resource]);
+
+          useEffect(() => {
+              const fetchResourceData = async () => {
+                  if (!resourceId) { setError("Resource ID is missing."); setLoading(false); return; }
+                  setLoading(true);
+                  try {
+                      const resourcesData = await getResources();
+                      setAllResources(resourcesData);
+                      const foundResource = resourcesData.find(r => r.id === resourceId);
+                      setResource(foundResource || null);
+                      if (!foundResource) setError('Resource not found.');
+                  } catch (err) { setError('Failed to load resource data.'); console.error(err); } 
+                  finally { setLoading(false); }
+              };
+              fetchResourceData();
+          }, [resourceId]);
+          
+          useEffect(() => {
+              if (!resource) return;
+
+              const restoreProgress = (player, isYt) => {
+                   if (user && resourceId) {
+                      const watchedData = parseWatchedDataWatch(user.watched);
+                      const savedProgress = watchedData[resourceId];
+                      if (savedProgress?.time) {
+                          if (isYt) player.seekTo(savedProgress.time, true);
+                          else player.currentTime = savedProgress.time;
+                      }
+                  }
+              };
+
+              if (isYoutubeVideo) {
+                  const videoId = getYoutubeVideoId(resource.video_link);
+                  if (!videoId) { setError("Invalid YouTube URL"); return; }
+                  
+                  const createPlayer = () => {
+                      if (ytPlayerRef.current) { ytPlayerRef.current.destroy(); }
+                      ytPlayerRef.current = new window.YT.Player('youtube-player-container', {
+                          videoId,
+                          playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1, playsinline: 1 },
+                          events: {
+                              onReady: (e) => {
+                                  const player = e.target;
+                                  durationRef.current = player.getDuration() || 0;
+                                  restoreProgress(player, true);
+                              },
+                              onStateChange: (e) => {
+                                  const state = e.data;
+                                  const playerState = window.YT.PlayerState;
+                                  setIsPlaying(state === playerState.PLAYING);
+                              },
+                              onError: (e) => {
+                                  console.error('YouTube Player Error:', e.data);
+                                  setError(`A YouTube player error occurred (code: ${e.data}). This video may be private, deleted, or unavailable for embedding.`);
+                              }
+                          }
+                      });
+                  };
+                  if (window.YT && window.YT.Player) createPlayer();
+                  else window.onYouTubeIframeAPIReady = createPlayer;
+              } else {
+                  const video = videoRef.current;
+                  if (!video) return;
+                  const onLoadedMetadata = () => { durationRef.current = video.duration; restoreProgress(video, false); };
+                  const onPlay = () => setIsPlaying(true);
+                  const onPause = () => setIsPlaying(false);
+                  video.addEventListener('loadedmetadata', onLoadedMetadata);
+                  video.addEventListener('play', onPlay);
+                  video.addEventListener('pause', onPause);
+                  if (video.readyState >= 1) onLoadedMetadata();
+                   return () => {
+                      video.removeEventListener('loadedmetadata', onLoadedMetadata);
+                      video.removeEventListener('play', onPlay);
+                      video.removeEventListener('pause', onPause);
+                  };
+              }
+              return () => {
+                  if (ytPlayerRef.current && typeof ytPlayerRef.current.destroy === 'function') {
+                      ytPlayerRef.current.destroy();
+                      ytPlayerRef.current = null;
+                  }
+              };
+          }, [resource, isYoutubeVideo, user, resourceId]);
+
+          useEffect(() => {
+              if (!isYoutubeVideo && videoRef.current) {
+                  videoRef.current.playbackRate = playbackRate;
+              }
+          }, [playbackRate, isYoutubeVideo]);
+
+          useEffect(() => {
+              const handleClickOutside = (event) => {
+                  if (speedMenuRef.current && !speedMenuRef.current.contains(event.target)) {
+                      setIsSpeedMenuOpen(false);
+                  }
+              };
+              document.addEventListener('mousedown', handleClickOutside);
+              return () => document.removeEventListener('mousedown', handleClickOutside);
+          }, []);
+
+          useEffect(() => {
+              const intervalId = setInterval(() => {
+                  if (isYoutubeVideo && ytPlayerRef.current?.getCurrentTime) {
+                      currentTimeRef.current = ytPlayerRef.current.getCurrentTime() || 0;
+                  } else if (!isYoutubeVideo && videoRef.current) {
+                      currentTimeRef.current = videoRef.current.currentTime || 0;
+                  }
+              }, 1000);
+              return () => clearInterval(intervalId);
+          }, [isYoutubeVideo]);
+
+           useEffect(() => {
+              if (user) watchedDataRef.current = parseWatchedDataWatch(user.watched);
+              const saveFinalProgress = () => {
+                  if (!user) return;
+                  const finalWatchedJSON = JSON.stringify(watchedDataRef.current);
+                  if (user.watched === finalWatchedJSON) return;
+                  const updatedUser = { ...user, watched: finalWatchedJSON };
+                  updateCurrentUser(updatedUser);
+                  updateUser(updatedUser).catch(err => console.error("Failed to save progress on exit:", err));
+              };
+              const progressUpdateInterval = setInterval(() => {
+                  if (!resourceId) return;
+                  const localCurrentTime = currentTimeRef.current;
+                  const localDuration = durationRef.current;
+                  if (isPlaying && localCurrentTime > 0 && localDuration > 0) {
+                      const isComplete = (localCurrentTime / localDuration) > 0.95;
+                      if (isComplete) {
+                          if (watchedDataRef.current[resourceId]) {
+                              delete watchedDataRef.current[resourceId];
+                          }
+                      } else {
+                          watchedDataRef.current[resourceId] = { time: localCurrentTime, duration: localDuration };
+                      }
+                  }
+              }, 3000);
+              window.addEventListener('beforeunload', saveFinalProgress);
+              return () => {
+                  clearInterval(progressUpdateInterval);
+                  window.removeEventListener('beforeunload', saveFinalProgress);
+                  saveFinalProgress();
+              };
+          }, [user, resourceId, updateCurrentUser, isPlaying]);
+          
+          const relatedResources = useMemo(() => {
+              if (!resource) return [];
+              return allResources.filter(r => r.Subject_Name === resource.Subject_Name && r.id !== resource.id).reverse();
+          }, [resource, allResources]);
+          
+          const forceDownload = async (url, fileName) => {
+              const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+              try {
+                  const res = await fetch(proxyUrl);
+                  if (!res.ok) throw new Error('Download failed: ' + res.status);
+                  const blob = await res.blob();
+                  const objectUrl = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = objectUrl; a.download = fileName;
+                  document.body.appendChild(a); a.click(); a.remove();
+                  setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+              } catch (err) {
+                  console.error("Download Error:", err);
+                  alert("Could not download the file. This may be due to a network issue or browser restrictions. Please try again later.");
+              }
+          };
+          
+          const handleDownloadPdf = async () => {
+              if (!resource) return;
+              setIsPdfDownloading(true);
+              await forceDownload(resource.pdf_link, `${resource.title}.pdf`);
+              setIsPdfDownloading(false);
+          };
+
+          const handleDownloadVideo = async () => {
+              if (!resource) return;
+              setIsVideoDownloading(true);
+              await forceDownload(resource.video_link, `${resource.title}.mp4`);
+              setIsVideoDownloading(false);
+          };
+
+          if (loading) return <div className="flex justify-center items-center h-[calc(100vh-10rem)]"><Spinner text="Loading course..." /></div>;
+          if (error || !resource) return <div className="pt-24 container mx-auto px-4 text-center text-red-500 text-xl">{error || 'Could not load the resource.'}</div>;
+          
+          return (
+            <>
+              <div className="container mx-auto px-2 sm:px-4 py-8 pt-20 sm:pt-24">
+                  <div className="grid grid-cols-1 lg:grid-cols-3 lg:gap-8 xl:gap-12">
+                      <main className="lg:col-span-2 animate-fade-in-up">
+                          <div className="relative aspect-video bg-black rounded-lg overflow-hidden shadow-2xl shadow-primary/20 border border-border-color">
+                              {isYoutubeVideo ? (
+                                  <div id="youtube-player-container" className="w-full h-full" />
+                              ) : (
+                                  <video ref={videoRef} src={resource.video_link} poster={resource.image_url} className="w-full h-full" controls controlsList="nodownload">
+                                      Your browser does not support the video tag.
+                                  </video>
+                              )}
+                          </div>
+                          <div className="mt-6 px-2">
+                              <p className="text-sm font-bold text-primary uppercase tracking-wider">{resource.Subject_Name}</p>
+                              <h1 className="text-2xl sm:text-3xl md:text-4xl font-extrabold text-text-primary mt-1 mb-4">{resource.title}</h1>
+                              <div className="flex flex-wrap gap-3">
+                                  <button onClick={() => setPdfOpen(true)} className="inline-flex items-center justify-center px-5 py-3 border border-transparent text-base font-medium rounded-md text-background bg-primary hover:bg-cyan-400 transition-transform hover:scale-105 shadow-lg shadow-primary/20"><DocumentIcon className="h-5 w-5 mr-2" /> View PDF</button>
+                                  <button onClick={() => setFlashcardOpen(true)} className="inline-flex items-center justify-center px-5 py-3 border border-border-color text-base font-medium rounded-md text-text-primary bg-surface hover:bg-slate-600 transition-transform hover:scale-105 shadow-lg"><CollectionIcon className="h-5 w-5 mr-2" /> Flashcards</button>
+                                  <button onClick={() => setTestOpen(true)} className="inline-flex items-center justify-center px-5 py-3 border border-secondary/50 text-base font-medium rounded-md text-secondary bg-secondary/10 hover:bg-secondary/20 transition-transform hover:scale-105 shadow-lg shadow-secondary/10"><BrainIcon className="h-5 w-5 mr-2" /> Test Me</button>
+                              </div>
+                               <div className="mt-4 flex flex-wrap gap-3 items-center">
+                                  <button onClick={handleDownloadPdf} disabled={isPdfDownloading} className="inline-flex items-center justify-center px-5 py-2 border border-border-color/50 text-sm font-medium rounded-full text-text-secondary bg-surface/50 hover:bg-slate-700 transition-transform hover:scale-105 shadow-md disabled:opacity-50">{isPdfDownloading ? <Spinner text="" /> : <><CloudDownloadIcon className="h-5 w-5 mr-2" /> Download PDF</>}</button>
+                                  {!isYoutubeVideo && (
+                                      <>
+                                          <button onClick={handleDownloadVideo} disabled={isVideoDownloading} className="inline-flex items-center justify-center px-5 py-2 border border-border-color/50 text-sm font-medium rounded-full text-text-secondary bg-surface/50 hover:bg-slate-700 transition-transform hover:scale-105 shadow-md disabled:opacity-50">{isVideoDownloading ? <Spinner text="" /> : <><CloudDownloadIcon className="h-5 w-5 mr-2" /> Download Video</>}</button>
+                                          <div className="relative" ref={speedMenuRef}>
+                                              <button onClick={() => setIsSpeedMenuOpen(!isSpeedMenuOpen)} className="inline-flex items-center justify-center px-5 py-2 border border-border-color/50 text-sm font-medium rounded-full text-text-secondary bg-surface/50 hover:bg-slate-700 transition-transform hover:scale-105 shadow-md" aria-haspopup="true" aria-expanded={isSpeedMenuOpen}>
+                                                  <SpeedIcon className="h-5 w-5 mr-2" />
+                                                  <span>{playbackRate}x</span>
+                                                  <ChevronDownIcon className={`h-4 w-4 ml-1 transition-transform ${isSpeedMenuOpen ? 'rotate-180' : ''}`} />
+                                              </button>
+                                              {isSpeedMenuOpen && (
+                                                  <div className="absolute bottom-full mb-2 w-28 bg-surface border border-border-color rounded-md shadow-lg py-1 z-10 animate-fade-in-up" style={{ animationDuration: '0.2s' }} role="menu">
+                                                      {[1, 1.25, 1.5, 1.75, 2, 2.5, 3].map(speed => (
+                                                          <button key={speed} onClick={() => { setPlaybackRate(speed); setIsSpeedMenuOpen(false); }} className="w-full flex items-center justify-between px-4 py-2 text-sm text-text-primary hover:bg-primary/20 hover:text-primary transition-colors" role="menuitem">
+                                                              <span>{speed}x</span>
+                                                              {playbackRate === speed && <CheckIcon className="h-4 w-4 text-primary" />}
+                                                          </button>
+                                                      ))}
+                                                  </div>
+                                              )}
+                                          </div>
+                                      </>
+                                  )}
+                              </div>
+                          </div>
+                      </main>
+                      {relatedResources.length > 0 && (
+                          <aside className="lg:col-span-1 mt-12 lg:mt-0 animate-fade-in-up" style={{animationDelay: '0.2s'}}>
+                              <h2 className="text-2xl font-bold text-text-primary mb-4 px-2">More from {resource.Subject_Name}</h2>
+                              <div className="flex flex-col gap-4 max-h-[calc(100vh-8rem)] overflow-y-auto scrollbar-thin pr-2">
+                                   {relatedResources.map((res) => (
+                                     <Link to={`/watch/${res.id}`} key={res.id} className="flex gap-4 bg-surface p-3 rounded-lg hover:bg-slate-700 transition-colors border border-transparent hover:border-border-color">
+                                          <img src={res.image_url} alt={res.title} className="w-32 aspect-video rounded object-cover flex-shrink-0" onError={(e) => { (e.target).src = `https://picsum.photos/seed/${encodeURIComponent(res.title)}/1280/720`; }}/>
+                                          <div className="flex flex-col justify-center">
+                                              <p className="text-xs font-bold text-secondary uppercase tracking-wide">{res.Subject_Name}</p>
+                                              <h3 className="text-sm font-bold text-text-primary leading-tight line-clamp-2">{res.title}</h3>
+                                          </div>
+                                      </Link>
+                                  ))}
+                              </div>
+                          </aside>
+                      )}
+                  </div>
+              </div>
+              <PdfViewerModal isOpen={isPdfOpen} onClose={() => setPdfOpen(false)} pdfUrl={resource.pdf_link} title={resource.title}/>
+              <MCQTestModal isOpen={isTestOpen} onClose={() => setTestOpen(false)} resource={resource}/>
+              <FlashcardModal isOpen={isFlashcardOpen} onClose={() => setFlashcardOpen(false)} resource={resource}/>
+               <style>{`#youtube-player-container, #youtube-player-container iframe { width: 100%; height: 100%; }`}</style>
+            </>
+          );
+      };
+      
+      // --- from pages/AdminDashboardPage.tsx ---
+      const dataURLtoFile = (dataurl, filename) => {
+          const arr = dataurl.split(',');
+          if (arr.length < 2) throw new Error("Invalid data URL");
+          const mimeMatch = arr[0].match(/:(.*?);/);
+          if (!mimeMatch) throw new Error("Could not determine MIME type from data URL");
+          const mime = mimeMatch[1];
+          const bstr = atob(arr[1]);
+          let n = bstr.length;
+          const u8arr = new Uint8Array(n);
+          while (n--) { u8arr[n] = bstr.charCodeAt(n); }
+          return new File([u8arr], filename, { type: mime });
+      }
+
+      const ResourceFormModal = ({ isOpen, onClose, onSave, resourceToEdit }) => {
+          const isEditMode = Boolean(resourceToEdit);
+          const [title, setTitle] = useState('');
+          const [subjectName, setSubjectName] = useState('');
+          const [subjects, setSubjects] = useState([]);
+          const [videoInputMethod, setVideoInputMethod] = useState('upload');
+          const [videoFile, setVideoFile] = useState(null);
+          const [pdfFile, setPdfFile] = useState(null);
+          const [videoLink, setVideoLink] = useState('');
+          const [pdfLink, setPdfLink] = useState('');
+          const [imageUrl, setImageUrl] = useState('');
+          const [newVideoFile, setNewVideoFile] = useState(null);
+          const [newPdfFile, setNewPdfFile] = useState(null);
+          const [newImageFile, setNewImageFile] = useState(null);
+          const [loading, setLoading] = useState(false);
+          const [progress, setProgress] = useState({ stage: '', percentage: 0 });
+          const [error, setError] = useState(null);
+          const [isSubjectDialogOpen, setSubjectDialogOpen] = useState(false);
+          const isYoutubeLink = (url) => url.includes('youtube.com') || url.includes('youtu.be');
+
+          useEffect(() => {
+              const fetchSubjects = async () => {
+                  try {
+                      const availableSubjects = await getSubjects();
+                      setSubjects(availableSubjects);
+                      if (resourceToEdit) {
+                          setTitle(resourceToEdit.title);
+                          setSubjectName(resourceToEdit.Subject_Name);
+                          setVideoLink(resourceToEdit.video_link);
+                          setPdfLink(resourceToEdit.pdf_link);
+                          setImageUrl(resourceToEdit.image_url);
+                          setVideoInputMethod(isYoutubeLink(resourceToEdit.video_link) ? 'link' : 'upload');
+                      } else if (availableSubjects.length > 0) {
+                          setSubjectName(availableSubjects[0].Subject_Name);
+                      }
+                  } catch (err) { console.error("Failed to load subjects", err); }
+              };
+
+              if (isOpen) {
+                  fetchSubjects();
+                  if (resourceToEdit) {
+                       setTitle(resourceToEdit.title);
+                       setSubjectName(resourceToEdit.Subject_Name);
+                       setVideoLink(resourceToEdit.video_link);
+                       setPdfLink(resourceToEdit.pdf_link);
+                       setImageUrl(resourceToEdit.image_url);
+                       setVideoInputMethod(isYoutubeLink(resourceToEdit.video_link) ? 'link' : 'upload');
+                  } else {
+                      setTitle(''); setSubjectName(''); setVideoFile(null); setPdfFile(null); setVideoLink(''); setPdfLink(''); setImageUrl(''); setVideoInputMethod('upload');
+                  }
+                  setNewVideoFile(null); setNewPdfFile(null); setNewImageFile(null); setError(null); setProgress({ stage: '', percentage: 0 });
+              }
+          }, [isOpen, resourceToEdit]);
+          
+          const handleFileChange = (e, setFile) => {
+              if (e.target.files && e.target.files[0]) setFile(e.target.files[0]);
+          };
+
+          const handleSubmit = async (e) => {
+              e.preventDefault();
+              setError(null);
+              if (!title || !subjectName) { setError('Title and Subject Name are required.'); return; }
+              if (!isEditMode) {
+                   if (videoInputMethod === 'upload' && !videoFile) { setError('A video file is required for the "Upload" option.'); return; }
+                   if (videoInputMethod === 'link' && !videoLink.trim()) { setError('A YouTube video link is required for the "Link" option.'); return; }
+                   if (!pdfFile) { setError('A PDF file is required for new resources.'); return; }
+              }
+              setLoading(true);
+              try {
+                  if (isEditMode && resourceToEdit) {
+                       let updatedVideoLink = videoLink, updatedPdfLink = pdfLink, updatedImageUrl = imageUrl;
+                       const baseName = resourceToEdit.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+                       const safeBaseName = (baseName || 'item').substring(0, 80);
+                       const itemName = `${safeBaseName}-${resourceToEdit.id}`;
+                      if (newVideoFile) updatedVideoLink = await uploadFile(newVideoFile, itemName, (p) => setProgress({ stage: `Uploading video...`, percentage: p }));
+                      if (newPdfFile) updatedPdfLink = await uploadFile(newPdfFile, itemName, (p) => setProgress({ stage: `Uploading PDF...`, percentage: p }));
+                      if (newImageFile) updatedImageUrl = await uploadFile(newImageFile, itemName, (p) => setProgress({ stage: `Uploading image...`, percentage: p }));
+                      
+                      setProgress({ stage: 'Updating resource details...', percentage: 95 });
+                      const resourceToUpdate = { ...resourceToEdit, title, Subject_Name: subjectName, video_link: updatedVideoLink, pdf_link: updatedPdfLink, image_url: updatedImageUrl };
+                      await updateResource(resourceToUpdate);
+                      setProgress({ stage: 'Update complete!', percentage: 100 });
+                  } else {
+                      if (!pdfFile) throw new Error("PDF file is missing.");
+                      const baseName = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+                      const safeBaseName = (baseName || 'item').substring(0, 80);
+                      const itemName = `${safeBaseName}-${Date.now()}`;
+                      let finalVideoUrl = '';
+                      if (videoInputMethod === 'upload') {
+                          if (!videoFile) throw new Error("Video file is missing.");
+                          finalVideoUrl = await uploadFile(videoFile, itemName, (p) => setProgress({ stage: `Uploading Video: ${videoFile.name}`, percentage: p }));
+                      } else {
+                          if (!videoLink.trim()) throw new Error("YouTube link is missing.");
+                          finalVideoUrl = videoLink;
+                      }
+                      const pdfUrl = await uploadFile(pdfFile, itemName, (p) => setProgress({ stage: `Uploading PDF: ${pdfFile.name}`, percentage: p }));
+                      setProgress({ stage: 'Generating AI cover image...', percentage: 25 });
+                      const imagePrompt = `Educational content for subject: "${subjectName}", with the title: "${title}"`;
+                      const base64Image = await generateImage(imagePrompt);
+                      setProgress({ stage: 'Uploading AI cover image...', percentage: 75 });
+                      const aiImageFile = dataURLtoFile(base64Image, 'cover.jpg');
+                      const imageUrl = await uploadFile(aiImageFile, itemName, (p) => setProgress({ stage: `Uploading AI cover image...`, percentage: p }));
+                      setProgress({ stage: 'Finalizing resource...', percentage: 50 });
+                      await createResource({ title, Subject_Name: subjectName, video_link: finalVideoUrl, pdf_link: pdfUrl, image_url: imageUrl });
+                      setProgress({ stage: 'Resource created!', percentage: 100 });
+                  }
+                  setTimeout(() => { onSave(); handleClose(); }, 1000);
+              } catch (err) {
+                  console.error(err);
+                  setError(`Operation failed: ${err.message || 'Please try again.'}`);
+                  setLoading(false);
+              }
+          };
+
+          const handleClose = () => {
+              if (loading) return;
+              setLoading(false); setError(null); setProgress({ stage: '', percentage: 0 }); onClose();
+          };
+
+          if (!isOpen) return null;
+
+          const inputClass = "mt-1 block w-full px-3 py-2 bg-surface border border-border-color rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-primary sm:text-sm text-text-primary placeholder-text-secondary transition";
+          const fileInputClass = "mt-1 block w-full text-sm text-text-secondary file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-primary/20 file:text-primary hover:file:bg-primary/30 transition-colors";
+
+          return (
+              <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex justify-center items-center p-4">
+                  <div className="bg-surface border border-border-color rounded-lg shadow-2xl p-6 w-full max-w-2xl transform transition-all animate-fade-in-up">
+                      <h2 className="text-xl font-bold text-text-primary mb-4">{isEditMode ? 'Edit Resource' : 'Add New Resource'}</h2>
+                      {loading ? <ProgressBar text={progress.stage} progress={progress.percentage} /> : (
+                          <form onSubmit={handleSubmit} className="space-y-4">
+                               {error && <div className="bg-red-500/20 border-l-4 border-red-400 text-red-300 p-4 rounded-md" role="alert"><p>{error}</p></div>}
+                              <div>
+                                  <label htmlFor="title" className="block text-sm font-medium text-text-secondary">Title</label>
+                                  <input type="text" value={title} onChange={(e) => setTitle(e.target.value)} required className={inputClass} />
+                              </div>
+                              <div>
+                                  <label className="block text-sm font-medium text-text-secondary">Subject Name</label>
+                                  <button type="button" onClick={() => setSubjectDialogOpen(true)} className={`${inputClass} text-left flex justify-between items-center`}>
+                                      <span className={subjectName ? 'text-text-primary' : 'text-text-secondary'}>{subjectName || 'Select a subject...'}</span>
+                                      <ChevronDownIcon className="h-5 w-5 text-text-secondary" />
+                                  </button>
+                              </div>
+                               <div>
+                                  <label className="block text-sm font-medium text-text-secondary mb-2">Video Source</label>
+                                   <div className="flex rounded-md shadow-sm bg-background/50 p-1 border border-border-color">
+                                      <button type="button" onClick={() => setVideoInputMethod('upload')} className={`px-4 py-2 text-sm font-medium transition-colors rounded-md flex-1 ${videoInputMethod === 'upload' ? 'bg-primary text-background shadow' : 'text-text-secondary hover:bg-surface'}`}>Upload File</button>
+                                      <button type="button" onClick={() => setVideoInputMethod('link')} className={`px-4 py-2 text-sm font-medium transition-colors rounded-md flex-1 ${videoInputMethod === 'link' ? 'bg-primary text-background shadow' : 'text-text-secondary hover:bg-surface'}`}>YouTube Link</button>
+                                  </div>
+                              </div>
+                              {isEditMode ? (
+                                 <>
+                                      {videoInputMethod === 'upload' ? (
+                                          <div className="p-3 bg-background/50 rounded-md space-y-2">
+                                              <label className="block text-sm font-medium text-text-secondary">Video File</label>
+                                              <p className="text-xs text-text-secondary truncate" title={videoLink}>Current: {videoLink}</p>
+                                              <label className="block text-xs font-medium text-text-secondary mt-2">Upload New Video to Replace (Optional)</label>
+                                              <input type="file" onChange={(e) => handleFileChange(e, setNewVideoFile)} accept="video/*" className={fileInputClass} />
+                                          </div>
+                                      ) : (
+                                          <div className="p-3 bg-background/50 rounded-md space-y-2">
+                                              <label htmlFor="video_link" className="block text-sm font-medium text-text-secondary">YouTube Video Link</label>
+                                              <input type="url" id="video_link" value={videoLink} onChange={(e) => setVideoLink(e.target.value)} required className={inputClass} placeholder="e.g., https://www.youtube.com/watch?v=..." />
+                                          </div>
+                                      )}
+                                      <div className="p-3 bg-background/50 rounded-md space-y-2">
+                                          <label htmlFor="pdf_link" className="block text-sm font-medium text-text-secondary">PDF Link</label>
+                                          <input type="url" id="pdf_link" value={pdfLink} onChange={(e) => setPdfLink(e.target.value)} required className={inputClass} />
+                                          <label className="block text-xs font-medium text-text-secondary mt-2">Replace PDF (Optional)</label>
+                                          <input type="file" onChange={(e) => handleFileChange(e, setNewPdfFile)} accept="application/pdf" className={fileInputClass} />
+                                      </div>
+                                      <div className="p-3 bg-background/50 rounded-md space-y-2">
+                                          <label htmlFor="image_url" className="block text-sm font-medium text-text-secondary">Cover Image URL</label>
+                                          <input type="url" id="image_url" value={imageUrl} onChange={(e) => setImageUrl(e.target.value)} required className={inputClass} />
+                                          <label className="block text-xs font-medium text-text-secondary mt-2">Replace Image (Optional)</label>
+                                          <input type="file" onChange={(e) => handleFileChange(e, setNewImageFile)} accept="image/*" className={fileInputClass} />
+                                      </div>
+                                  </>
+                              ) : (
+                                  <>
+                                      {videoInputMethod === 'upload' ? (
+                                          <div><label className="block text-sm font-medium text-text-secondary">Video File</label><input type="file" onChange={(e) => handleFileChange(e, setVideoFile)} required={videoInputMethod === 'upload'} accept="video/*" className={fileInputClass} /></div>
+                                      ) : (
+                                           <div><label className="block text-sm font-medium text-text-secondary">YouTube Video Link</label><input type="url" value={videoLink} onChange={(e) => setVideoLink(e.target.value)} required={videoInputMethod === 'link'} placeholder="e.g., https://www.youtube.com/watch?v=..." className={inputClass} /></div>
+                                      )}
+                                      <div><label className="block text-sm font-medium text-text-secondary">PDF Document</label><input type="file" onChange={(e) => handleFileChange(e, setPdfFile)} required accept="application/pdf" className={fileInputClass} /></div>
+                                  </>
+                              )}
+                              <div className="flex justify-end pt-4 gap-4">
+                                  <button type="button" onClick={handleClose} className="bg-slate-600 text-text-primary font-bold py-2 px-4 rounded-md hover:bg-slate-500 transition">Cancel</button>
+                                  <button type="submit" className="bg-primary text-background font-bold py-2 px-6 rounded-md hover:bg-cyan-400 transition">{isEditMode ? 'Save Changes' : 'Add Resource'}</button>
+                              </div>
+                          </form>
+                      )}
+                  </div>
+                   <SubjectSelectionDialog isOpen={isSubjectDialogOpen} onClose={() => setSubjectDialogOpen(false)} subjects={subjects} selectedSubject={subjectName} onSelectSubject={setSubjectName} />
+              </div>
+          );
+      };
+      const AdminDashboardPage = () => {
+          const { user } = useAuth();
+          const [activeTab, setActiveTab] = useState('content');
+          const [loading, setLoading] = useState(true);
+          const [error, setError] = useState(null);
+          const [resources, setResources] = useState([]);
+          const [resourceSearchTerm, setResourceSearchTerm] = useState('');
+          const [isFormModalOpen, setFormModalOpen] = useState(false);
+          const [resourceToEdit, setResourceToEdit] = useState(null);
+          const [resourceToDelete, setResourceToDelete] = useState(null);
+          const [users, setUsers] = useState([]);
+          const [userSearchTerm, setUserSearchTerm] = useState('');
+          const [userDialog, setUserDialog] = useState({action: null, user: null});
+          const [subjects, setSubjects] = useState([]);
+          const [subjectSearchTerm, setSubjectSearchTerm] = useState('');
+          const [newSubjectName, setNewSubjectName] = useState('');
+          const [editingSubject, setEditingSubject] = useState(null);
+          const [subjectToDelete, setSubjectToDelete] = useState(null);
+          const [isSubmitting, setIsSubmitting] = useState(false);
+          const [isOrderChanged, setIsOrderChanged] = useState(false);
+
+          const fetchData = useCallback(async (tab) => {
+              setLoading(true); setError(null);
+              try {
+                  if (tab === 'content') { const data = await getResources(); setResources(data.reverse()); } 
+                  else if (tab === 'users' && user?.role === 'super_admin') { const data = await getUsers(); setUsers(data.filter(u => u.id !== user?.id)); } 
+                  else if (tab === 'subjects') { const data = await getSubjects(); setSubjects(data.sort((a, b) => a.number - b.number)); setIsOrderChanged(false); }
+              } catch (err) { setError(`Failed to load ${tab}. Please refresh.`); } 
+              finally { setLoading(false); }
+          }, [user]);
+
+          useEffect(() => { fetchData(activeTab); }, [activeTab, fetchData]);
+          
+          const filteredResources = useMemo(() => resources.filter(r => r.title.toLowerCase().includes(resourceSearchTerm.toLowerCase()) || r.Subject_Name.toLowerCase().includes(resourceSearchTerm.toLowerCase())), [resources, resourceSearchTerm]);
+          const filteredUsers = useMemo(() => users.filter(u => u.name.toLowerCase().includes(userSearchTerm.toLowerCase()) || u.email.toLowerCase().includes(userSearchTerm.toLowerCase())), [users, userSearchTerm]);
+          const filteredSubjects = useMemo(() => subjects.filter(s => s.Subject_Name.toLowerCase().includes(subjectSearchTerm.toLowerCase())), [subjects, subjectSearchTerm]);
+
+          const handleAddResource = () => { setResourceToEdit(null); setFormModalOpen(true); };
+          const handleEditResource = (res) => { setResourceToEdit(res); setFormModalOpen(true); };
+          const handleDeleteResource = async () => { if (!resourceToDelete) return; await deleteResource(resourceToDelete.id); setResourceToDelete(null); fetchData('content'); };
+          const handleUserRoleChange = async (targetUser, newRole) => { if (targetUser.role === newRole) return; await updateUser({ ...targetUser, role: newRole }); setUserDialog({action: null, user: null}); fetchData('users'); };
+          const handleDeleteUser = async () => { if (!userDialog.user) return; await deleteUser(userDialog.user.id); setUserDialog({action: null, user: null}); fetchData('users'); };
+          const handleAddSubject = async (e) => { e.preventDefault(); if (!newSubjectName.trim()) return; setIsSubmitting(true); await addSubject(newSubjectName); setNewSubjectName(''); await fetchData('subjects'); setIsSubmitting(false); };
+          const handleUpdateSubject = async () => { if (!editingSubject) return; setIsSubmitting(true); await updateSubject(editingSubject.subject.id, editingSubject.newName); setEditingSubject(null); await fetchData('subjects'); setIsSubmitting(false); };
+          const handleDeleteSubject = async () => { if (!subjectToDelete) return; setIsSubmitting(true); await deleteSubject(subjectToDelete.id); setSubjectToDelete(null); await fetchData('subjects'); setIsSubmitting(false); };
+          const handleMoveSubject = (index, direction) => {
+              const newSubjects = [...subjects];
+              const targetIndex = direction === 'up' ? index - 1 : index + 1;
+              if (targetIndex < 0 || targetIndex >= newSubjects.length) return;
+              [newSubjects[index], newSubjects[targetIndex]] = [newSubjects[targetIndex], newSubjects[index]];
+              setSubjects(newSubjects); setIsOrderChanged(true);
+          };
+          const handleSaveOrder = async () => {
+              setIsSubmitting(true);
+              try {
+                  const updatePromises = subjects.map((subject, index) => updateSubject(subject.id, subject.Subject_Name, index) );
+                  await Promise.all(updatePromises);
+                  setIsOrderChanged(false);
+              } catch (error) { console.error("Failed to save subject order:", error); setError("Could not save the new order. Please try again."); } 
+              finally { setIsSubmitting(false); fetchData('subjects'); }
+          };
+          
+          const TabButton = ({ tab, label, icon }) => (
+              <button onClick={() => setActiveTab(tab)} className={`flex items-center gap-2 px-3 sm:px-4 py-2 text-sm font-medium rounded-t-md transition-colors border-b-2 ${activeTab === tab ? 'text-primary border-primary' : 'text-text-secondary border-transparent hover:text-text-primary hover:border-border-color'}`}>
+                  {icon}<span className="hidden sm:inline">{label}</span>
+              </button>
+          );
+          
+          const inputClass = "flex-grow block w-full px-3 py-2 bg-surface border border-border-color rounded-md focus:outline-none focus:ring-2 focus:ring-primary text-text-primary placeholder-text-secondary transition";
+          const searchInputClass = "w-full pl-10 pr-3 py-2 bg-surface border border-border-color rounded-md focus:outline-none focus:ring-2 focus:ring-primary text-text-primary placeholder-text-secondary transition";
+
+          return (
+              <div className="container mx-auto px-2 sm:px-4 py-8 pt-20 sm:pt-24">
+                  <div className="mb-6 border-b border-border-color pb-2"><h1 className="text-2xl sm:text-3xl font-bold text-text-primary">Admin Dashboard</h1><p className="text-sm sm:text-md text-text-secondary">Manage application content and users.</p></div>
+                  <div className="border-b border-border-color flex gap-1 sm:gap-4">
+                      <TabButton tab="content" label="Content" icon={<VideoIcon className="h-5 w-5"/>} /><TabButton tab="subjects" label="Subjects" icon={<ClipboardListIcon className="h-5 w-5"/>} />
+                      {user?.role === 'super_admin' && <TabButton tab="users" label="Users" icon={<UserGroupIcon className="h-5 w-5"/>} />}
+                  </div>
+                  <div className="mt-6">
+                      {error && <div className="text-center text-red-500 text-xl">{error}</div>}
+                      {loading && <Spinner />}
+                      {!loading && !error && (<>
+                          {activeTab === 'content' && (
+                               <div className="bg-surface border border-border-color rounded-lg shadow-md p-2 sm:p-4">
+                                  <div className="flex flex-col sm:flex-row justify-between sm:items-center mb-4 gap-2">
+                                      <h2 className="text-xl font-bold">Manage Content</h2>
+                                      <div className="flex gap-2 w-full sm:w-auto">
+                                          <div className="relative flex-grow"><SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-gray-400" /><input type="text" placeholder="Search content..." value={resourceSearchTerm} onChange={e => setResourceSearchTerm(e.target.value)} className={searchInputClass} /></div>
+                                          <button onClick={handleAddResource} className="bg-primary text-background font-bold py-2 px-4 rounded-md hover:bg-cyan-400 transition flex items-center justify-center gap-2 flex-shrink-0"><PlusCircleIcon className="h-5 w-5" /> <span className="hidden sm:inline">Add New</span></button>
+                                      </div>
+                                  </div>
+                                  <div className="overflow-x-auto overscroll-x-contain">
+                                      <table className="min-w-full divide-y divide-border-color">
+                                          <thead className="bg-background/50"><tr><th className="px-2 sm:px-4 py-3 text-left text-xs font-medium text-text-secondary uppercase">Title</th><th className="px-2 sm:px-4 py-3 text-left text-xs font-medium text-text-secondary uppercase">Subject</th><th className="px-2 sm:px-4 py-3 text-right text-xs font-medium text-text-secondary uppercase">Actions</th></tr></thead>
+                                          <tbody className="divide-y divide-border-color">
+                                              {filteredResources.map(res => (<tr key={res.id} className="hover:bg-background/50"><td className="px-2 sm:px-4 py-3 text-sm text-text-primary truncate max-w-xs">{res.title}</td><td className="px-2 sm:px-4 py-3 text-sm text-text-secondary">{res.Subject_Name}</td><td className="px-2 sm:px-4 py-3 text-right flex gap-1 sm:gap-2 justify-end"><button onClick={() => handleEditResource(res)} className="p-2 text-text-secondary hover:text-primary"><EditIcon className="h-5 w-5" /></button>{(user?.role === 'admin' || user?.role === 'super_admin') && <button onClick={() => setResourceToDelete(res)} className="p-2 text-text-secondary hover:text-red-500"><TrashIcon className="h-5 w-5" /></button>}</td></tr>))}
+                                          </tbody>
+                                      </table>
+                                  </div>
+                              </div>
+                          )}
+                          {activeTab === 'users' && user?.role === 'super_admin' && (
+                               <div className="bg-surface border border-border-color rounded-lg shadow-md p-2 sm:p-4">
+                                   <div className="flex flex-col sm:flex-row justify-between sm:items-center mb-4 gap-2"><h2 className="text-xl font-bold">Manage Users</h2><div className="relative w-full sm:w-1/2"><SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-gray-400" /><input type="text" placeholder="Search by name or email..." value={userSearchTerm} onChange={e => setUserSearchTerm(e.target.value)} className={searchInputClass} /></div></div>
+                                   <div className="overflow-x-auto overscroll-x-contain">
+                                       <table className="min-w-full divide-y divide-border-color">
+                                           <thead className="bg-background/50"><tr><th className="px-2 sm:px-4 py-3 text-left text-xs font-medium text-text-secondary uppercase">Name</th><th className="px-2 sm:px-4 py-3 text-left text-xs font-medium text-text-secondary uppercase">Email</th><th className="px-2 sm:px-4 py-3 text-left text-xs font-medium text-text-secondary uppercase">Role</th><th className="px-2 sm:px-4 py-3 text-right text-xs font-medium text-text-secondary uppercase">Actions</th></tr></thead>
+                                           <tbody className="divide-y divide-border-color">
+                                               {filteredUsers.map(u => (<tr key={u.id} className="hover:bg-background/50"><td className="px-2 sm:px-4 py-3 text-sm text-text-primary">{u.name}</td><td className="px-2 sm:px-4 py-3 text-sm text-text-primary truncate max-w-xs">{u.email}</td><td className="px-2 sm:px-4 py-3 text-sm text-text-secondary"><select value={u.role} onChange={(e) => handleUserRoleChange(u, e.target.value)} className={`${inputClass} max-w-xs py-1`}><option value="user">User</option><option value="admin">Admin</option><option value="super_admin">Super Admin</option></select></td><td className="px-2 sm:px-4 py-3 text-right"><button onClick={() => setUserDialog({action: 'delete', user: u})} className="p-2 text-text-secondary hover:text-red-500"><TrashIcon className="h-5 w-5" /></button></td></tr>))}
+                                           </tbody>
+                                       </table>
+                                   </div>
+                               </div>
+                          )}
+                          {activeTab === 'subjects' && (
+                               <div className="bg-surface border border-border-color rounded-lg shadow-md p-2 sm:p-4 relative">
+                                  {isSubmitting && <div className="absolute inset-0 bg-surface/80 z-10 flex items-center justify-center"><Spinner text="Processing..." /></div>}
+                                  <div className="flex flex-col sm:flex-row justify-between sm:items-center mb-4 gap-2"><h2 className="text-xl font-bold">Manage Subjects</h2><div className="relative w-full sm:w-1/2"><SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-gray-400" /><input type="text" placeholder="Search subjects..." value={subjectSearchTerm} onChange={e => setSubjectSearchTerm(e.target.value)} className={searchInputClass} /></div></div>
+                                  <form onSubmit={handleAddSubject} className="flex gap-2 mb-4"><input type="text" value={newSubjectName} onChange={e => setNewSubjectName(e.target.value)} placeholder="New subject name" className={inputClass} required /><button type="submit" className="bg-primary text-background font-bold py-2 px-4 rounded-md hover:bg-cyan-400 transition">Add</button></form>
+                                   {isOrderChanged && (<div className="bg-primary/20 border border-primary/50 text-primary p-3 rounded-md mb-4 flex justify-between items-center"><span>You've changed the subject order.</span><button onClick={handleSaveOrder} className="bg-primary text-background font-bold py-1 px-4 rounded-md hover:bg-cyan-400 transition">Save Order</button></div>)}
+                                  <div className="max-h-96 overflow-y-auto overscroll-y-contain scrollbar-thin pr-2">
+                                      <ul className="divide-y divide-border-color">
+                                          {filteredSubjects.map((s, index) => (
+                                              <li key={s.id} className="py-2 flex items-center justify-between gap-2">
+                                                  {editingSubject?.subject.id === s.id ? (<div className="flex-grow flex gap-2 items-center"><input type="text" value={editingSubject.newName} onChange={e => setEditingSubject({...editingSubject, newName: e.target.value})} className={inputClass} autoFocus onBlur={handleUpdateSubject} onKeyDown={e => e.key === 'Enter' && handleUpdateSubject()} /></div>) : (<>
+                                                          <div className="flex items-center gap-2">
+                                                              <div className="flex flex-col"><button onClick={() => handleMoveSubject(index, 'up')} disabled={index === 0} className="p-1 text-text-secondary hover:text-primary disabled:opacity-30"><ArrowUpIcon className="h-4 w-4" /></button><button onClick={() => handleMoveSubject(index, 'down')} disabled={index === subjects.length - 1} className="p-1 text-text-secondary hover:text-primary disabled:opacity-30"><ArrowDownIcon className="h-4 w-4" /></button></div>
+                                                              <span className="text-sm text-text-primary">{s.Subject_Name}</span>
+                                                          </div>
+                                                          <div className="flex gap-2"><button onClick={() => setEditingSubject({subject: s, newName: s.Subject_Name})} className="p-2 text-text-secondary hover:text-primary"><EditIcon className="h-5 w-5" /></button><button onClick={() => setSubjectToDelete(s)} className="p-2 text-text-secondary hover:text-red-500"><TrashIcon className="h-5 w-5" /></button></div>
+                                                      </>)}
+                                              </li>
+                                          ))}
+                                      </ul>
+                                  </div>
+                              </div>
+                          )}
+                      </>)}
+                  </div>
+                  <ResourceFormModal isOpen={isFormModalOpen} onClose={() => setFormModalOpen(false)} onSave={() => fetchData('content')} resourceToEdit={resourceToEdit} />
+                  <ConfirmDialog isOpen={!!resourceToDelete} onClose={() => setResourceToDelete(null)} onConfirm={handleDeleteResource} title="Delete Resource" message={<>Delete <strong>{resourceToDelete?.title}</strong>? This is irreversible.</>} />
+                  <ConfirmDialog isOpen={userDialog.action === 'delete'} onClose={() => setUserDialog({action: null, user: null})} onConfirm={handleDeleteUser} title="Delete User" message={<>Delete user <strong>{userDialog.user?.email}</strong>? This is irreversible.</>} />
+                  <ConfirmDialog isOpen={!!subjectToDelete} onClose={() => setSubjectToDelete(null)} onConfirm={handleDeleteSubject} title="Delete Subject" message={<>Delete subject <strong>{subjectToDelete?.Subject_Name}</strong>? This is irreversible.</>} />
+              </div>
+          );
+      };
+      
+      // --- from App.tsx ---
+      const ProtectedLayout = () => (
+        <div className="min-h-screen flex flex-col">
+          <Header />
+          <main className="flex-grow">
+            <Outlet />
+          </main>
+        </div>
+      );
+
+      const App = () => {
+        useEffect(() => {
+          const handleContextMenu = (event) => event.preventDefault();
+          const handleDragStart = (event) => {
+            if (event.target instanceof HTMLImageElement || event.target instanceof HTMLAnchorElement || event.target instanceof HTMLVideoElement) {
+              event.preventDefault();
+            }
+          };
+          document.addEventListener('contextmenu', handleContextMenu);
+          document.addEventListener('dragstart', handleDragStart);
+          return () => {
+            document.removeEventListener('contextmenu', handleContextMenu);
+            document.removeEventListener('dragstart', handleDragStart);
+          };
+        }, []);
+
+        return (
+          <AuthProvider>
+            <HashRouter>
+              <Routes>
+                <Route path="/login" element={<LoginPage />} />
+                <Route path="/signup" element={<SignupPage />} />
+                <Route path="/" element={<ProtectedRoute><ProtectedLayout /></ProtectedRoute>}>
+                  <Route index element={<HomePage />} />
+                  <Route path="watch/:resourceId" element={<WatchPage />} />
+                  <Route path="profile" element={<ProfilePage />} />
+                   <Route path="admin" element={<ProtectedRoute allowedRoles={['admin', 'super_admin']}><AdminDashboardPage /></ProtectedRoute>} />
+                </Route>
+              </Routes>
+            </HashRouter>
+          </AuthProvider>
+        );
+      };
+
+      // --- APPLICATION ENTRY POINT ---
       const rootElement = document.getElementById('root');
       if (!rootElement) {
         throw new Error("Could not find root element to mount to");
       }
-
       const root = ReactDOM.createRoot(rootElement);
       root.render(
         <React.StrictMode>
